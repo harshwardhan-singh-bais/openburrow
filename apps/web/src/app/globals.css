@@ -1,0 +1,218 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+ * Dark mode
+ *
+ * Class-based rather than `prefers-color-scheme`, because the reel player and
+ * the bus feed are read next to a terminal and people want to match *that*, not
+ * their OS. The OS preference is only the initial value.
+ * ------------------------------------------------------------------------- */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------
+ * Design tokens
+ *
+ * OKLCH, not hex. The whole palette is one hue rotation with a fixed lightness
+ * ramp, so "make the warning a bit warmer" is a number rather than a new colour
+ * picked by eye. That is the difference between a palette and a pile of colours.
+ * ------------------------------------------------------------------------- */
+:root {
+  --radius: 0.625rem;
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+
+  /* Lane state colours. These mirror `output.STATE_STYLES` in the Python CLI on
+   * purpose: a lane that is amber in the terminal must be amber here, or the two
+   * surfaces disagree about what "blocked" looks like and people stop trusting
+   * either. The mapping is documented in docs/web/README.md. */
+  --state-idle: oklch(0.62 0.02 250);
+  --state-working: oklch(0.62 0.16 250);
+  --state-blocked: oklch(0.72 0.17 75);
+  --state-done: oklch(0.62 0.15 150);
+  --state-failed: oklch(0.58 0.22 25);
+  --state-cancelled: oklch(0.6 0.02 250);
+
+  /* Governance is its own hue because it is not a lane state. A refusal is not
+   * "failed" — it is a deliberate act by a human or a policy, and colouring it
+   * like a crash teaches the wrong thing. */
+  --governance: oklch(0.55 0.2 305);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.185 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 12%);
+  --input: oklch(1 0 0 / 16%);
+  --ring: oklch(0.556 0 0);
+
+  /* Lightened for a dark surface. The same lightness that reads as "amber" on
+   * white reads as "mud" on near-black, so these are re-picked rather than
+   * reused — a shared token across both themes is how one of them ends up
+   * unreadable. */
+  --state-idle: oklch(0.72 0.02 250);
+  --state-working: oklch(0.74 0.15 250);
+  --state-blocked: oklch(0.82 0.16 75);
+  --state-done: oklch(0.76 0.16 150);
+  --state-failed: oklch(0.72 0.19 25);
+  --state-cancelled: oklch(0.7 0.02 250);
+  --governance: oklch(0.74 0.17 305);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-state-idle: var(--state-idle);
+  --color-state-working: var(--state-working);
+  --color-state-blocked: var(--state-blocked);
+  --color-state-done: var(--state-done);
+  --color-state-failed: var(--state-failed);
+  --color-state-cancelled: var(--state-cancelled);
+  --color-governance: var(--governance);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    /* `antialiased` on a light background makes 12px text noticeably lighter
+     * than the designer intended; only apply it where it helps. */
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* A focus ring that is visible on both themes without being a box-shadow
+   * stack. The offset keeps it off the element's own border, which matters for
+   * the bus feed rows where borders are the row separator. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* The bus feed and the reel both render fixed-width transcript content that
+   * must not reflow, because reflowing a terminal transcript changes what it
+   * says. */
+  .transcript {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .transcript-nowrap {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    white-space: pre;
+  }
+
+  /* Scrollbars in a dark UI. Default scrollbars are drawn by the OS in light
+   * colours and look like a rendering bug against a dark panel. */
+  .scrollbar-slim {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .scrollbar-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-slim::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 9999px;
+  }
+  .scrollbar-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* A lane that is actively working gets a slow pulse. Deliberately subtle and
+ * deliberately not a spinner: motion that never stops is motion people stop
+ * seeing, and the point is to draw the eye when something *changes*. */
+@keyframes lane-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.animate-lane-pulse {
+  animation: lane-pulse 2.4s ease-in-out infinite;
+}
+
+/* Respect the OS setting. An animation that cannot be turned off is an
+ * accessibility bug, not a style choice. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-lane-pulse {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

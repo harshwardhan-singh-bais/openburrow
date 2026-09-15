@@ -1,0 +1,306 @@
+[project]
+name = "openburrow"
+version = "0.1.0"
+description = "Terminal-native, protocol-grounded multi-harness agent collaboration platform."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "OpenBurrow Contributors" }]
+keywords = ["agents", "a2a", "mcp", "acp", "multi-agent", "cli", "tui", "orchestration"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/openburrow/openburrow"
+Documentation = "https://github.com/openburrow/openburrow/tree/main/docs"
+Repository = "https://github.com/openburrow/openburrow"
+Changelog = "https://github.com/openburrow/openburrow/blob/main/CHANGELOG.md"
+Issues = "https://github.com/openburrow/openburrow/issues"
+
+[project.optional-dependencies]
+# Convenience umbrella so `uv sync --extra all` installs the full platform.
+all = [
+  "openburrow-core",
+  "openburrow-a2a",
+  "openburrow-acp",
+  "openburrow-adapters",
+  "openburrow-governance",
+  "openburrow-brain",
+  "openburrow-radar",
+  "openburrow-reel",
+  "openburrow-daemon",
+  "openburrow-cli",
+  "openburrow-relay",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = []
+
+# ---------------------------------------------------------------------------
+# uv workspace — every package under packages/ is a first-class workspace member
+# ---------------------------------------------------------------------------
+[tool.uv]
+package = false
+link-mode = "copy"
+compile-bytecode = true
+# Pinned so `uv sync` is reproducible across machines and CI.
+managed = true
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+openburrow-core = { workspace = true }
+openburrow-a2a = { workspace = true }
+openburrow-acp = { workspace = true }
+openburrow-adapters = { workspace = true }
+openburrow-governance = { workspace = true }
+openburrow-brain = { workspace = true }
+openburrow-radar = { workspace = true }
+openburrow-reel = { workspace = true }
+openburrow-daemon = { workspace = true }
+openburrow-cli = { workspace = true }
+openburrow-relay = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "pytest-timeout>=2.3",
+  "anyio>=4.6",
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "pyright>=1.1.390",
+  "types-pexpect>=4.9",
+  # PyYAML ships no inline types, and `config/repo_config.py` parses YAML,
+  # so without this stub every `yaml.safe_load` result is untyped. The
+  # sibling `types-pexpect` is here for the same reason.
+  "types-PyYAML>=6.0",
+  "pre-commit>=4.0",
+  "build>=1.2",
+  "twine>=6.0",
+]
+docs = [
+  "mkdocs-material>=9.5",
+  "mkdocs-mermaid2-plugin>=1.1",
+  "mkdocstrings[python]>=0.27",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["packages/*/src", "packages/*/tests"]
+extend-exclude = [".venv", "apps/web", "node_modules", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",     # pycodestyle
+  "F",          # pyflakes
+  "I",          # isort
+  "N",          # pep8-naming
+  "UP",         # pyupgrade
+  "B",          # flake8-bugbear
+  "A",          # flake8-builtins
+  "C4",         # flake8-comprehensions
+  "DTZ",        # flake8-datetimez
+  "T20",        # flake8-print (no stray prints in library code)
+  "SIM",        # flake8-simplify
+  "TID",        # flake8-tidy-imports
+  "RUF",        # ruff-specific
+  "S",          # bandit-style security checks
+  "ASYNC",      # async correctness
+  "PTH",        # prefer pathlib
+  "RET",        # return semantics
+  "ARG",        # unused arguments
+  "PL",         # pylint subset
+]
+ignore = [
+  "E501",    # line length handled by the formatter
+  "S101",    # assert is fine in tests
+  "PLR0913", # too many arguments — domain models legitimately have many fields
+  # The rules below are off because the pattern they flag is a deliberate,
+  # project-wide convention — not because the findings were inconvenient. Each
+  # entry names the convention it protects, so the next reader can tell a
+  # considered decision from a silenced warning.
+  #
+  # PLC0415: imports are deferred into functions so optional heavy dependencies
+  #   (textual, pexpect, litellm, fastapi) are paid for only by the code paths
+  #   that use them, and so `burrow --version` does not import a web stack. The
+  #   same reasoning is recorded against `**/__main__.py` below.
+  "PLC0415",
+  # PLR2004: the literals flagged are protocol-defined numbers — HTTP status
+  #   codes and A2A state codes — where the number is the clearest name.
+  #   `HTTP_OK` would add an indirection the reader has to resolve.
+  "PLR2004",
+  # ARG002: unused method arguments come from interface conformance. IPC
+  #   handlers all share `(self, params)` because they live in one dispatch
+  #   table, adapter factories all take `lane`, and ABC hooks take arguments
+  #   most implementations ignore. Renaming them would break the shared
+  #   signature that makes the dispatch and the template methods work.
+  "ARG002",
+  # PLR0917: the positional-argument sibling of PLR0913 above, same reason.
+  "PLR0917",
+  # ASYNC109: an explicit `timeout` parameter is the point. The rule prefers
+  #   `asyncio.timeout()` inside the callee, which hides the budget from the
+  #   caller; these APIs want the caller to state it.
+  "ASYNC109",
+]
+
+# NOT enabled, and recorded here so it stays a decision rather than an
+# oversight: `BLE` (blind except). Enabling it reports 40 `except Exception`
+# sites across the daemon, relay and adapters, most of which are structural
+# error boundaries where catching wide is correct — an IPC dispatch loop must
+# not let one malformed request kill the daemon. Triaging all 40 into
+# justified suppressions is real work, and doing it badly would be worse than
+# not doing it: 40 rubber-stamped noqas teach the next reader to ignore noqas.
+# Note that 53 `# noqa: BLE001` comments used to exist for this rule before it
+# was ever selected; those were removed, because a suppression for a rule that
+# never runs is a claim of review that never happened.
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101", "S105", "S106", "ARG001", "PLR2004", "S104", "PLC0415", "SIM117"]
+"**/cli/**" = ["T201"]   # the CLI is allowed to print
+"**/scripts/**" = ["T201"]
+# A `__main__.py` is a console entry point: printing is its job, and the lazy
+# imports inside `main()` are deliberate so that `--version` and `--check` do not
+# pay to import the web stack.
+"**/__main__.py" = ["T201", "PLC0415"]
+# Domain-named exceptions. `PolicyViolation`, `ApprovalRequired` and
+# `ApprovalTimeout` are the vocabulary the CLI, the docs and the policy gate
+# all use; `PolicyViolationError` is a longer name for the same thing.
+"**/core/errors.py" = ["N818"]
+# `run_daemon` is a process entry point. It reports a startup failure on
+# stderr even when logging has not been configured yet — which is precisely
+# the case where a log call would go nowhere — so a print is the right tool.
+"**/daemon/server.py" = ["T201"]
+
+[tool.ruff.lint.pylint]
+# Raised above the defaults rather than disabled, so the rules still catch a
+# genuinely tangled function. The functions that tripped them are dispatch
+# points — adapter selection, IPC routing — where the branch count tracks the
+# number of real cases rather than accumulated special-casing.
+max-returns = 8      # default 6
+max-branches = 14    # default 12
+max-statements = 80  # default 50
+
+[tool.ruff.lint.isort]
+known-first-party = ["openburrow"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.12"
+# Pydantic v2 ships a mypy plugin, and without it mypy cannot see the
+# synthesised members of a model — `Model.model_validate` on a
+# `type[SomeModel]` reads as a missing attribute. Enabling it is the
+# documented setup for a Pydantic project rather than a workaround.
+plugins = ["pydantic.mypy"]
+# The bases are listed explicitly because `openburrow` is a PEP 420 namespace
+# package: there is no `src/openburrow/__init__.py`, since the eleven
+# distributions each contribute a subpackage to one shared namespace. With
+# `explicit_package_bases` on, that omission lets mypy derive two roots for the
+# same file — `.../src` and `.../src/openburrow` — and it reports every module
+# under both names (`openburrow.a2a.card` and `a2a.card`) and aborts the run.
+# Naming the roots removes the ambiguity.
+#
+# An earlier version said `mypy_path = "packages"`, which is not a package root
+# at all; the layout is `packages/openburrow-<name>/src/openburrow/`. That was
+# wrong before the namespace issue even came up.
+#
+# Every package also carries a `py.typed` marker, and that is load-bearing
+# rather than ceremonial: without one, PEP 561 tells mypy these are untyped
+# third-party libraries and it skips analysing them. That single omission
+# produced 385 `import-untyped` errors, which buried every real finding behind
+# them — the run reported 506 problems and none of them were the code's fault.
+mypy_path = [
+  "packages/openburrow-a2a/src",
+  "packages/openburrow-acp/src",
+  "packages/openburrow-adapters/src",
+  "packages/openburrow-brain/src",
+  "packages/openburrow-cli/src",
+  "packages/openburrow-core/src",
+  "packages/openburrow-daemon/src",
+  "packages/openburrow-governance/src",
+  "packages/openburrow-radar/src",
+  "packages/openburrow-reel/src",
+  "packages/openburrow-relay/src",
+]
+namespace_packages = true
+explicit_package_bases = true
+# `conftest.py` is excluded by filename. pytest requires that exact name in every
+# test root, so eleven of them collide on the module name `conftest` and mypy
+# aborts with "Duplicate module named 'conftest'" — taking the whole run with it,
+# since a duplicate-module error prevents further checking. This is not
+# hypothetical: adding a conftest to `openburrow-core` broke a previously clean
+# run, and the failure mode was mypy reporting *one* error and stopping.
+#
+# The alternatives do not work. Renaming is not possible. Adding `__init__.py`
+# to each `tests/` makes mypy name them `tests.conftest` — the same collision
+# through a different door — and makes pytest import them as `tests.*`, which
+# reintroduces the identical clash at collection time.
+#
+# The cost is that fixture bodies are not type-checked. The mitigation is that
+# pytest imports every conftest on every run, so a conftest that does not import
+# fails the suite loudly. That is not true of the code mypy is actually for,
+# which is why this exclusion is limited to this one filename.
+exclude = ["(^|/)conftest\\.py$"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["ptyprocess.*", "pexpect.*", "pycrdt.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["packages"]
+pythonpath = ["packages"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+timeout = 120
+markers = [
+  "unit: fast, no I/O",
+  "integration: touches sqlite / filesystem / sockets",
+  "e2e: spawns real harnesses (skipped unless OPENBURROW_E2E=1)",
+  "chaos: fault-injection scenarios",
+  "governance: delegation / audit / attack-surface tests",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["packages"]
+omit = ["*/tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

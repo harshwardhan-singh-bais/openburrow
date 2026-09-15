@@ -1,0 +1,162 @@
+# Documentation site configuration.
+#
+# Built with `--strict` in CI, which turns every warning into an error. That is
+# deliberate and it is the reason the nav below is exhaustive rather than
+# partial: MkDocs warns about a nav entry pointing at a file that does not
+# exist, *and* about a documentation file that no nav entry references. The
+# second warning is the useful one — it is how a page written six months ago and
+# never linked stops being invisible.
+#
+# So: every file under docs/ appears here. If you add a page, add it to the nav
+# or CI will tell you.
+
+site_name: OpenBurrow
+site_description: >-
+  Terminal-native, protocol-grounded multi-harness agent collaboration. The bus
+  speaks A2A, tool access is MCP passthrough, negotiation is ACP, and a
+  governance layer answers what all three leave unspecified.
+site_url: https://openburrow.dev/
+repo_url: https://github.com/openburrow/openburrow
+repo_name: openburrow/openburrow
+
+# `edit_uri` is left at the default so a "edit this page" link lands on the file
+# the page was generated from rather than on the docs root.
+
+theme:
+  name: material
+  features:
+    # The three that earn their keep on a docs site this size. `navigation.instant`
+    # in particular, because the architecture pages are read in sequence and a
+    # full reload between each one loses the reader's scroll position.
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - toc.follow
+  palette:
+    # Light/dark toggle rather than a media query, matching the web app — the
+    # docs are read next to a terminal as often as the board is.
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: README.md
+  - Architecture:
+      - Overview: architecture/overview.md
+      - Decision records:
+          - Index: architecture/adr/README.md
+          # Numbered and listed explicitly rather than globbed, because the
+          # number *is* the citation. `burrow` prints "see ADR 0003" in error
+          # hints, and a nav that reordered them would make that reference wrong.
+          - "0001 — Protocol grounding": architecture/adr/0001-protocol-grounding.md
+          - "0002 — MCP as passthrough": architecture/adr/0002-mcp-passthrough.md
+          - "0003 — A dedicated governance layer": architecture/adr/0003-governance-layer.md
+          - "0004 — Append-only bus log": architecture/adr/0004-append-only-bus-log.md
+          - "0005 — Python, not Rust": architecture/adr/0005-python-not-rust.md
+          - "0006 — SQLite locally, Postgres for the relay": architecture/adr/0006-sqlite-and-postgres.md
+          - "0007 — CRDT as projection": architecture/adr/0007-crdt-as-projection.md
+          - "0008 — Claims, not locks": architecture/adr/0008-claims-not-locks.md
+          - "0009 — Detection vs enforcement": architecture/adr/0009-detection-vs-enforcement.md
+          - "0010 — The adapter protocol": architecture/adr/0010-adapter-protocol.md
+  - Protocols:
+      - A2A: protocols/a2a.md
+      - ACP: protocols/acp.md
+      - MCP: protocols/mcp.md
+  - Governance:
+      - The model: governance/model.md
+  - Adapters:
+      - Authoring a harness adapter: adapters/authoring.md
+  - CLI:
+      - Overview: cli/README.md
+  - Web:
+      - Overview: web/README.md
+  - Relay:
+      - Deployment: deployment/README.md
+  - Roadmap: roadmap/README.md
+  - Contributing: contributing/README.md
+
+plugins:
+  - search
+  # Renders ```mermaid fences as diagrams. The A2A and ACP pages both lean on
+  # sequence diagrams, and a sequence diagram expressed as an indented list is
+  # a sequence diagram nobody reads.
+  - mermaid2
+  # Pulls docstrings out of the installed packages. Requires the workspace to be
+  # installed, which is why CI runs `uv sync --group docs` before building.
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            # Signatures in the body, not in a separate heading — the docs pages
+            # that use this are explaining a mechanism, and a reader wants the
+            # signature next to the explanation rather than above it.
+            show_source: false
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+            docstring_style: google
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # The ADR numbers and the protocol sections are cited by anchor from the
+      # CLI's error hints, so the slugs must be stable and readable.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      # The CLI's `--json` output and the bus payloads are JSON; without this,
+      # a fenced block with no language renders as plain text and loses its
+      # structure.
+      line_spans: __span
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      # Lets a page include a real file from the repo — `--8<-- "docs/snippets/x.md"`.
+      # Worth having because a copied example is an example that goes stale, and
+      # the failure mode is a docs page that documents an API that no longer
+      # exists.
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/openburrow/openburrow
+  # The footer says when the site was built, which is the only signal a reader
+  # has that a page describing a protocol is current.
+  generator: false
+
+# No `not_in_nav`: the nav above is exhaustive on purpose. A file that exists but
+# is unreachable from the nav is a page nobody will find, and `--strict` warning
+# about it is the point rather than the problem.
+
+strict: true

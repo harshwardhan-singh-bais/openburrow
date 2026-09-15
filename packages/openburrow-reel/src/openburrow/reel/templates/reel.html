@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="OpenBurrow reel exporter {{ viewer_version }}">
+<title>{{ session_name }} — session reel</title>
+<style>
+  :root {
+    --bg: #fbfbfa;
+    --panel: #ffffff;
+    --line: #e4e4e2;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --accent: #0b6bcb;
+    --certain: #b42318;
+    --predicted: #9a6700;
+    --governance: #6b21a8;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d; --panel: #1d2025; --line: #2e3238; --text: #e6e8eb;
+      --muted: #9aa1ab; --accent: #5aa2f0; --certain: #f2736a;
+      --predicted: #e3b341; --governance: #c99bf5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    display: flex; flex-wrap: wrap; gap: 18px; align-items: baseline;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  #scrub-wrap { padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #scrub { width: 100%; accent-color: var(--accent); }
+  #clock { font: 12px var(--mono); color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 3fr) minmax(280px, 1.2fr); gap: 1px; background: var(--line); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .pane { background: var(--panel); min-width: 0; }
+  .pane > h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
+  }
+  #lanes { display: flex; flex-direction: column; }
+  .lane { border-bottom: 1px solid var(--line); }
+  .lane-head {
+    display: flex; gap: 10px; align-items: baseline;
+    padding: 8px 14px; font-size: 12px; cursor: pointer;
+  }
+  .lane-head .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .lane-head .name { font-weight: 600; font-family: var(--mono); }
+  .lane-head .count { color: var(--muted); }
+  .lane-head .gap { color: var(--certain); font-size: 11px; }
+  pre.term {
+    margin: 0; padding: 10px 14px; font: 12px/1.45 var(--mono);
+    white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow: auto;
+    border-top: 1px dashed var(--line);
+  }
+  .lane.collapsed pre.term { display: none; }
+  #events { max-height: 70vh; overflow: auto; }
+  .ev {
+    padding: 7px 14px; border-bottom: 1px solid var(--line); font-size: 12px; cursor: pointer;
+    display: grid; grid-template-columns: 62px 1fr; gap: 8px;
+  }
+  .ev:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .ev.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .ev .t { font-family: var(--mono); color: var(--muted); }
+  .ev .type { font-family: var(--mono); font-size: 11px; }
+  .ev .sum { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .ev.governance .type { color: var(--governance); }
+  .ev.negotiation .type { color: var(--predicted); }
+  .ev.claim .type { color: var(--accent); }
+  #chain { padding: 12px 14px; font-size: 12px; border-top: 1px solid var(--line); color: var(--muted); }
+  #chain ol { margin: 6px 0 0 18px; padding: 0; }
+  #chain li { margin: 3px 0; }
+  footer { padding: 12px 20px; color: var(--muted); font-size: 11px; }
+  code { font-family: var(--mono); background: color-mix(in srgb, var(--muted) 12%, transparent); padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>{{ session_name }}</h1>
+  <span class="meta">{{ lane_count }} lane(s) · {{ duration_label }} · {{ event_count }} event(s)</span>
+  {% if negotiation_count %}<span class="meta">{{ negotiation_count }} negotiation(s)</span>{% endif %}
+  {% if governance_event_count %}<span class="meta">{{ governance_event_count }} governance event(s)</span>{% endif %}
+  <span class="spacer"></span>
+  <span class="meta">exported {{ exported_label }}{% if redactions %} · {{ redactions }} redaction(s){% endif %}</span>
+</header>
+
+<div id="scrub-wrap">
+  <input id="scrub" type="range" min="0" max="{{ duration }}" value="{{ duration }}" step="0.05" aria-label="Replay position">
+  <div id="clock">t+{{ duration_label }} / {{ duration_label }}</div>
+</div>
+
+<main>
+  <section class="pane">
+    <h2>lanes — transcript up to the scrubber</h2>
+    <div id="lanes"></div>
+  </section>
+  <section class="pane">
+    <h2>causal events</h2>
+    <div id="events"></div>
+    <div id="chain">Click an event to trace what caused it.</div>
+  </section>
+</main>
+
+<footer>
+  This viewer is a <strong>transcript scrubber</strong>: text and causal events on a shared clock.
+  For a faithful terminal replay, play the <code>.cast</code> files in this bundle with
+  <code>asciinema play</code>. Both are included because they answer different questions.
+  {% if redacted_types %}<br>Redacted before signing: {{ redacted_types }}.{% endif %}
+</footer>
+
+<script id="reel-data" type="application/json">{{ reel_json | safe }}</script>
+<script>
+(function () {
+  "use strict";
+  var REEL = JSON.parse(document.getElementById("reel-data").textContent);
+  var lanesEl = document.getElementById("lanes");
+  var eventsEl = document.getElementById("events");
+  var chainEl = document.getElementById("chain");
+  var scrub = document.getElementById("scrub");
+  var clock = document.getElementById("clock");
+
+  var byId = {};
+  REEL.timeline.forEach(function (e) { if (e.id) byId[e.id] = e; });
+
+  function fmt(t) {
+    var m = Math.floor(t / 60), s = t - m * 60;
+    return (m ? m + "m " : "") + s.toFixed(1) + "s";
+  }
+
+  function buildLanes() {
+    REEL.lanes.forEach(function (lane) {
+      var wrap = document.createElement("div");
+      wrap.className = "lane";
+      wrap.dataset.lane = lane.id;
+
+      var head = document.createElement("div");
+      head.className = "lane-head";
+      head.innerHTML =
+        '<span class="dot"></span>' +
+        '<span class="name"></span>' +
+        '<span class="count"></span>' +
+        (lane.has_cast ? "" : '<span class="gap">no cast recorded</span>');
+      head.querySelector(".name").textContent = lane.title || lane.id;
+      head.querySelector(".count").textContent = lane.events.length + " output event(s)";
+      head.addEventListener("click", function () { wrap.classList.toggle("collapsed"); });
+
+      var pre = document.createElement("pre");
+      pre.className = "term";
+      pre.textContent = "";
+
+      wrap.appendChild(head);
+      wrap.appendChild(pre);
+      lanesEl.appendChild(wrap);
+      lane._pre = pre;
+    });
+  }
+
+  function renderAt(t) {
+    clock.textContent = "t+" + fmt(t) + " / " + fmt(REEL.duration);
+    REEL.lanes.forEach(function (lane) {
+      var text = "";
+      for (var i = 0; i < lane.events.length; i++) {
+        if (lane.events[i][0] > t) break;
+        text += lane.events[i][1];
+      }
+      lane._pre.textContent = text;
+      if (lane._pre.scrollHeight > lane._pre.clientHeight) {
+        lane._pre.scrollTop = lane._pre.scrollHeight;
+      }
+    });
+    var active = null;
+    var items = eventsEl.querySelectorAll(".ev");
+    for (var j = 0; j < items.length; j++) {
+      var et = parseFloat(items[j].dataset.t);
+      if (et <= t) { items[j].classList.remove("active"); active = items[j]; }
+      else { items[j].classList.remove("active"); }
+    }
+    if (active) active.classList.add("active");
+  }
+
+  function buildEvents() {
+    REEL.timeline.forEach(function (e) {
+      var row = document.createElement("div");
+      var group = String(e.type || "").split(".")[0];
+      row.className = "ev " + group;
+      row.dataset.t = e.t;
+      row.dataset.id = e.id || "";
+      var left = document.createElement("span");
+      left.className = "t";
+      left.textContent = "+" + fmt(e.t);
+      var right = document.createElement("span");
+      var type = document.createElement("div");
+      type.className = "type";
+      type.textContent = e.type + (e.lane_id ? " · " + e.lane_id.slice(0, 14) : "");
+      right.appendChild(type);
+      if (e.summary) {
+        var sum = document.createElement("div");
+        sum.className = "sum";
+        sum.textContent = e.summary;
+        right.appendChild(sum);
+      }
+      row.appendChild(left);
+      row.appendChild(right);
+      row.addEventListener("click", function () {
+        scrub.value = e.t;
+        renderAt(e.t);
+        showChain(e.id);
+      });
+      eventsEl.appendChild(row);
+    });
+  }
+
+  function showChain(id) {
+    var out = [], guard = 0, cur = byId[id];
+    while (cur && guard++ < 64) {
+      out.unshift(cur);
+      cur = cur.caused_by ? byId[cur.caused_by] : null;
+    }
+    if (out.length <= 1) {
+      chainEl.textContent = "No recorded cause for this event.";
+      return;
+    }
+    chainEl.innerHTML = "<strong>why this happened:</strong>";
+    var ol = document.createElement("ol");
+    out.forEach(function (e) {
+      var li = document.createElement("li");
+      li.textContent = "+" + fmt(e.t) + "  " + e.type + (e.summary ? " — " + e.summary : "");
+      ol.appendChild(li);
+    });
+    chainEl.appendChild(ol);
+  }
+
+  scrub.max = REEL.duration;
+  scrub.addEventListener("input", function () { renderAt(parseFloat(scrub.value)); });
+  buildLanes();
+  buildEvents();
+  renderAt(REEL.duration);
+})();
+</script>
+</body>
+</html>

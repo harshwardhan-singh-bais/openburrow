@@ -1,0 +1,40 @@
+[project]
+name = "openburrow-core"
+version = "0.1.0"
+description = "OpenBurrow core: domain models, configuration, local state, and shared primitives."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "sqlmodel>=0.0.22",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "aiosqlite>=0.20",
+  "alembic>=1.14",
+  "pyyaml>=6.0",
+  "structlog>=24.4",
+  "platformdirs>=4.3",
+  "python-dotenv>=1.0",
+  "rich>=13.9",
+  "tomli-w>=1.1",
+  "ulid-py>=1.1",
+]
+
+[project.optional-dependencies]
+crdt = ["pycrdt>=0.10"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openburrow"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "mypy>=1.13",
+  "ruff>=0.8",
+]

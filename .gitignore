@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+.eggs/
+*.egg
+
+# ---------------------------------------------------------------------------
+# uv
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+# NOTE: uv.lock IS committed on purpose — it is the reproducible build contract.
+# .python-version IS committed on purpose — pins the interpreter for everyone.
+
+# ---------------------------------------------------------------------------
+# Tooling caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---------------------------------------------------------------------------
+# Node / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+npm-install.log
+
+# ---------------------------------------------------------------------------
+# OpenBurrow runtime artifacts (never committed — these are per-machine state)
+# ---------------------------------------------------------------------------
+.openburrow/
+**/.openburrow/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+burrow.sock
+burrow.pid
+burrow.log
+logs/
+.casts/
+reels/
+traces/
+*.cast
+
+# ---------------------------------------------------------------------------
+# Secrets — see .env.example for the documented, committable template
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+!**/*.pub.key.example
+secrets/
+credentials.json
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Local agent scratch — useful locally, noise in history
+# (.workbuddy-ai holds per-machine agent memory; same reasoning as *.local.md)
+.workbuddy-ai/
+# ---------------------------------------------------------------------------
+*.local.md
+scratch/
+tmp/
+.tmp/

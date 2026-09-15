@@ -1,0 +1,221 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the test run deterministic and quiet. No provider keys are set on
+  # purpose: every path that needs an LLM must degrade rather than fail, and CI
+  # is where that gets verified.
+  OPENBURROW_ENV: test
+  OPENBURROW_LOG_LEVEL: WARNING
+
+jobs:
+  lint:
+    name: lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: imports resolve
+        # The only gate here that actually executes code. `ruff` and `mypy` are
+        # both static, and both were green while a module-level `NameError` made
+        # the entire `core` package unloadable: a patch moved a field-default
+        # helper below the class that used it, and since field defaults evaluate
+        # eagerly, importing the module raised. Every other check in this file
+        # would have passed. This one would not have.
+        run: uv run python scripts/check_imports.py
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: mypy
+        run: uv run mypy packages
+      - name: enum parity
+        # The frontend's types are hand-written mirrors of the Python enums, and
+        # nothing else stops them from diverging. This check found a real drift
+        # on its first run: the TypeScript claimed `reject` and `withdraw` were
+        # dead ends, while Python says they are answered by `propose` and
+        # `inform`. Both were internally consistent, so no unit test could have
+        # caught it — only a comparison against the origin can.
+        run: uv run python scripts/check_enum_parity.py
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is in the matrix deliberately. Several bugs in this project
+        # were platform-specific — the daemon's named-pipe IPC, the socket
+        # permission path, and the uvicorn keep-alive parser bug that only
+        # reproduced here. A Linux-only matrix would have shipped all three.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: install
+        run: uv sync --frozen --python ${{ matrix.python }}
+      - name: unit tests
+        run: uv run pytest -m unit
+      - name: governance tests
+        # Mandatory. These assert the four invariants; a failure here means the
+        # authority model is broken, which is a release blocker regardless of
+        # anything else.
+        run: uv run pytest -m governance
+      - name: integration tests
+        # Exit 5 means "collected nothing". `openburrow-core` used to be on the
+        # list below; it is not any more, because the bus write path turned out
+        # to be dead and nothing exercised it. The remaining eight still have an
+        # empty tests/ directory. The notice is not swallowed, and anything other
+        # than 5 still fails the job — so the step stops being a no-op the moment
+        # real integration tests land, without anyone having to remember to edit
+        # this file.
+        #
+        # The alternative was to delete the step until the tests exist. That
+        # hides the gap; a permanent notice in the log is the reminder.
+        run: |
+          uv run pytest -m integration
+          status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "::notice title=integration tests::none collected yet — packages with empty tests/: a2a, acp, adapters, brain, cli, daemon, radar, reel"
+            exit 0
+          fi
+          exit $status
+      - name: chaos tests
+        # Same treatment, same reason.
+        run: |
+          uv run pytest -m chaos
+          status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "::notice title=chaos tests::none collected yet"
+            exit 0
+          fi
+          exit $status
+
+  smoke:
+    name: smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: end-to-end
+        # Stands up two real A2A servers on ephemeral ports, fetches an Agent
+        # Card over HTTP, delivers a JSON-RPC message, runs a full ACP
+        # negotiation, and asserts the governance invariants. This is the check
+        # that catches cross-package breakage, which unit tests cannot see.
+        run: uv run python scripts/smoke_test.py
+
+  cli:
+    name: CLI surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: help renders
+        run: uv run burrow --help
+      - name: version reports
+        run: uv run burrow --version
+      - name: adapters enumerate
+        # Must not fail when no harness is installed — the registry reports
+        # availability rather than requiring it.
+        run: uv run burrow adapters list
+      - name: doctor runs
+        # Exit code 3 is acceptable here: it means "not initialised in this
+        # directory", which is correct for a fresh checkout. Anything else is a
+        # real failure.
+        run: |
+          set +e
+          uv run burrow doctor
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+            echo "doctor exited $code, expected 0 or 3"
+            exit 1
+          fi
+      - name: exit codes are semantic
+        # A usage error must exit 2, and a governance refusal must exit 6.
+        # Collapsing these into 1 would make a CI gate that asserts "no
+        # governance violations occurred" impossible to write.
+        run: |
+          set +e
+          uv run burrow --json --quiet > /dev/null 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit 2 for mutually exclusive flags, got $code"
+            exit 1
+          fi
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --group docs
+      - name: build
+        run: uv run --group docs mkdocs build --strict
+      - name: links resolve
+        # `--strict` validates the nav; it does not validate links written in
+        # prose. This does, and it also checks that every `#anchor` still names a
+        # heading — which is what stops a link surviving a section rename.
+        run: uv run --group docs python scripts/check_docs_links.py
+
+  web:
+    name: web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: install
+        run: npm ci --no-audit --no-fund
+        working-directory: apps/web
+      - name: typecheck
+        # `tsc --noEmit` is the check that matters here. The route handlers talk
+        # to a socket and the components talk to a daemon that is not running in
+        # CI, so there is nothing to integration-test — but a type error is a
+        # page that does not render, and the types are the only thing standing
+        # between the UI and a JSON payload it did not expect.
+        run: npx tsc --noEmit
+        working-directory: apps/web
+      - name: lint
+        run: npm run lint
+        working-directory: apps/web
+      - name: build
+        # The build is not just a compile check. It is what catches a route
+        # handler that imports `node:net` into a client component — which is a
+        # failure that typechecks fine and only appears when the page is
+        # rendered.
+        run: npm run build
+        working-directory: apps/web
+        env:
+          # No daemon and no relay in CI. The build must not need either: the
+          # board is expected to render its "daemon is not answering" panel
+          # rather than fail.
+          OPENBURROW_WEB_STATIC: "0"

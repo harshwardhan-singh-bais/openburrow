@@ -1,0 +1,23 @@
+[project]
+name = "openburrow-acp"
+version = "0.1.0"
+description = "OpenBurrow ACP layer: typed negotiation performatives (propose/accept/reject/counter)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12,<3.14"
+# Deliberately dependency-light. ACP's performative vocabulary is small, no
+# mature SDK exists yet, and hand-rolling a handful of Pydantic models is
+# cheaper than vendoring someone else's half-finished one.
+dependencies = [
+  "openburrow-core",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openburrow"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "mypy>=1.13", "ruff>=0.8"]

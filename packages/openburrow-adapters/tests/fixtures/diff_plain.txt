@@ -1,0 +1,7 @@
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -12,7 +12,9 @@ def parse(source):
+     tokens = lex(source)
+-    return build(tokens)
++    tree = build(tokens)
++    return optimize(tree)

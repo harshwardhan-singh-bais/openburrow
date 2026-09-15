@@ -1,0 +1,4 @@
+I looked at the failing test. It expects the parser to skip comment-only lines,
+which it does not do yet.
+
+The change is small: return early when the stripped text starts with "#".

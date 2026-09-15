@@ -1,0 +1,3 @@
+- Inspect the parser module
+- Apply the signature change
+- Run the test suite

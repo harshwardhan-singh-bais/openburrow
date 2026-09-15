@@ -1,0 +1,39 @@
+[
+  {
+    "id": "msg_1",
+    "role": "assistant",
+    "parts": [{"type": "text", "text": "I will update the parser."}],
+    "usage": {"input_tokens": 12, "output_tokens": 8},
+    "completed": false
+  },
+  {
+    "id": "msg_2",
+    "role": "assistant",
+    "parts": [{"type": "tool", "tool": "read", "content": "src/parser.py"}],
+    "completed": false
+  },
+  {
+    "id": "msg_3",
+    "role": "assistant",
+    "parts": [
+      {
+        "type": "patch",
+        "content": "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -1,3 +1,3 @@\n-def parse(x):\n+def parse(x: str):\n     return x\n"
+      }
+    ],
+    "cost": 0.0021,
+    "completed": false
+  },
+  {
+    "id": "msg_4",
+    "role": "assistant",
+    "parts": [{"type": "text", "text": "Done."}],
+    "usage": {"input_tokens": 5, "output_tokens": 3},
+    "completed": true
+  },
+  {
+    "id": "msg_5",
+    "role": "user",
+    "parts": [{"type": "text", "text": "carry on"}]
+  }
+]

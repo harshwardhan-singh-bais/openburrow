@@ -1,0 +1,16 @@
+Crush renders a styled TUI and reads AGENTS.md natively, so its chunk is
+checked for two things: the diff survives the styling, and the AGENTS.md
+note is attached.
+
+╭─────────────────────────────╮
+│  crush  ·  session sess_c   │
+╰─────────────────────────────╯
+
+Loaded AGENTS.md from the repository root.
+
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -1,3 +1,3 @@
+-def parse(x):
++def parse(x: str):
+     return x

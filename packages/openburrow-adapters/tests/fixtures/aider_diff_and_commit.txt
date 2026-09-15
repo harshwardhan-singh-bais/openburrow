@@ -1,0 +1,10 @@
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -12,7 +12,10 @@ def parse(text):
+     if not text:
+         return None
++    if text.startswith("#"):
++        return None
+     return text.strip()
+Applied edit to src/parser.py
+Commit 4f2a9c1 fix: ignore comment-only lines

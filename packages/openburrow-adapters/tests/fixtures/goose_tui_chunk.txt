@@ -1,0 +1,9 @@
+( O)> I'll start by reading the parser and the tests.
+
+─── developer ──────────────────────────────
+I read src/parser.py and tests/test_parser.py.
+
+Here is what I will do:
+1. Add the missing comment branch to parse()
+2. Cover it with a regression test
+3. Run the suite and report the result

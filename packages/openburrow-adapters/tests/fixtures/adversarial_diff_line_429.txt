@@ -1,0 +1,7 @@
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -429,6 +429,7 @@ def parse(source):
+     tokens = lex(source)
+     assert len(tokens) == 429
++    tree = build(tokens)
+     return build(tokens)

@@ -1,0 +1,48 @@
+[project]
+name = "openburrow-relay"
+version = "0.1.0"
+description = "OpenBurrow relay server: FastAPI + WebSocket + Postgres for remote teammates and multi-tenancy."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "openburrow-core",
+  "fastapi>=0.115",
+  # [standard] is required for the same reason as in openburrow-a2a: it is what
+  # supplies httptools. See the comment in that manifest for the full story.
+  "uvicorn[standard]>=0.32",
+  "websockets>=13.1",
+  "asyncpg>=0.30",
+  "sqlmodel>=0.0.22",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "python-jose[cryptography]>=3.3",
+  "httpx>=0.27",
+  "prometheus-client>=0.21",
+  # Deliberately absent, each for a concrete reason rather than an oversight:
+  #
+  #   passlib[bcrypt]   — there are no passwords. Access is an invite token with
+  #                       256 bits of entropy, hashed with SHA-256 for storage.
+  #                       A password KDF on a token that cannot be guessed is
+  #                       ceremony, and bcrypt's 72-byte truncation would be a
+  #                       silent bug if a token ever were passed through it.
+  #   python-multipart  — no form bodies and no uploads. Every endpoint takes
+  #                       JSON. Adding the dependency for a form we do not have
+  #                       is how a file-upload surface appears by accident.
+  #   slowapi           — the rate limiter is `ratelimit.TokenBucket`, the same
+  #                       one the WebSocket uses. Two limiters with two configs
+  #                       and two failure modes is worse than one, and slowapi
+  #                       cannot guard a WebSocket anyway.
+]
+
+[project.scripts]
+openburrow-relay = "openburrow.relay.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openburrow"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.27", "mypy>=1.13", "ruff>=0.8"]

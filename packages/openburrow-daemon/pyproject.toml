@@ -1,0 +1,34 @@
+[project]
+name = "openburrow-daemon"
+version = "0.1.0"
+description = "OpenBurrow daemon: the long-running asyncio process owning session state, the event bus, and IPC."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "openburrow-core",
+  "openburrow-a2a",
+  "openburrow-acp",
+  "openburrow-adapters",
+  "openburrow-governance",
+  "openburrow-brain",
+  "openburrow-radar",
+  "openburrow-reel",
+  "watchfiles>=0.24",
+  "psutil>=6.1",
+  "websockets>=13.1",
+  "opentelemetry-api>=1.28",
+  "opentelemetry-sdk>=1.28",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.28",
+  "opentelemetry-instrumentation-asyncio>=0.49b0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openburrow"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "mypy>=1.13", "ruff>=0.8"]

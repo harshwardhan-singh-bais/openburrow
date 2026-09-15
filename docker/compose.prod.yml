@@ -1,0 +1,130 @@
+# Production stack: relay + Postgres + web.
+#
+# Read this before using it. Three things are deliberately *not* here, and their
+# absence is the design:
+#
+# 1. **No daemon.** The daemon owns a repo on a real filesystem, and its control
+#    socket's file permissions are its entire access control. Containerising it
+#    means mounting the repo and the socket, at which point the container is
+#    adding a boundary it cannot enforce. Run the daemon on the machine that has
+#    the repo.
+# 2. **No harness binaries.** A lane runs a harness — `claude`, `opencode`,
+#    `crush` — which needs its own credentials, its own config directory, and
+#    usually its own interactive login. Baking those into an image is how a
+#    credential ends up in a registry.
+# 3. **No TLS termination.** This stack assumes something in front of it does
+#    that (a load balancer, Caddy, Traefik). `OPENBURROW_RELAY_TLS_TERMINATED=true`
+#    is how you tell the relay to trust `X-Forwarded-For` for client keys, and
+#    setting it *without* a real proxy in front means every client can forge its
+#    own rate-limit key.
+#
+#   docker compose -f docker/compose.prod.yml up -d
+#
+# Required before first start — the stack refuses to come up without them:
+#
+#   export OPENBURROW_RELAY_JWT_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"
+#   export OPENBURROW_POSTGRES_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+#
+# Both are `:?` below, so a missing one fails the compose run with a sentence
+# naming the variable, rather than starting a relay with no auth.
+
+name: openburrow
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: openburrow
+      POSTGRES_PASSWORD: ${OPENBURROW_POSTGRES_PASSWORD:?set OPENBURROW_POSTGRES_PASSWORD}
+      POSTGRES_DB: openburrow
+      # Not published. The relay reaches Postgres over the compose network, and a
+      # database port on the host is a database port on the host.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openburrow -d openburrow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: relay
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      OPENBURROW_RELAY_DB_URL: postgresql+asyncpg://openburrow:${OPENBURROW_POSTGRES_PASSWORD}@postgres:5432/openburrow
+      OPENBURROW_RELAY_JWT_SECRET: ${OPENBURROW_RELAY_JWT_SECRET:?set OPENBURROW_RELAY_JWT_SECRET}
+      OPENBURROW_RELAY_LOG_LEVEL: INFO
+      # JSON, because the only consumer of these logs in production is a log
+      # aggregator, and a console renderer with ANSI colour is a log line nothing
+      # can parse.
+      OPENBURROW_RELAY_LOG_FORMAT: json
+      # The origin the web app is served from. Without this the relay refuses the
+      # browser's cross-origin upgrade, which is the correct default: an open
+      # WebSocket origin is a WebSocket any page can open.
+      OPENBURROW_RELAY_ALLOWED_ORIGINS: ${OPENBURROW_WEB_ORIGIN:?set OPENBURROW_WEB_ORIGIN}
+      OPENBURROW_RELAY_TLS_TERMINATED: "true"
+      OPENBURROW_RELAY_HOST: 0.0.0.0
+      OPENBURROW_RELAY_PORT: "8787"
+      OPENBURROW_RELAY_RETENTION_DAYS: ${OPENBURROW_RELAY_RETENTION_DAYS:-30}
+      OPENBURROW_RELAY_METRICS_ENABLED: "true"
+    # Not published to the host either. Whatever terminates TLS talks to this
+    # over the compose network; the relay has no business being directly
+    # reachable, and `expose` documents that without opening a port.
+    expose:
+      - "8787"
+    networks:
+      - backend
+      - frontend
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: web
+    restart: unless-stopped
+    depends_on:
+      - relay
+    environment:
+      # The relay's origin, server-side only. Deliberately not
+      # OPENBURROW_RELAY_URL — that is the CLI's client setting and its value is
+      # a WebSocket URL with a path, not an HTTP origin.
+      OPENBURROW_WEB_RELAY_URL: http://relay:8787
+      # The browser dials the relay's WebSocket directly, because a Next route
+      # handler cannot proxy a long-lived bidirectional socket. This is an
+      # origin, not a credential.
+      NEXT_PUBLIC_OPENBURROW_RELAY_WS: ${OPENBURROW_RELAY_WS_ORIGIN:?set OPENBURROW_RELAY_WS_ORIGIN}
+      # There is no daemon in this stack, so the board will show the "daemon is
+      # not answering" panel. That is correct and expected: the daemon runs on
+      # the machine that has the repo, and the route handlers reach it over a
+      # mounted socket, not over the network.
+      OPENBURROW_REPO_ROOT: /repo
+      OPENBURROW_DAEMON_SOCKET: /repo/.openburrow/burrow.sock
+      NODE_ENV: production
+    volumes:
+      # Read-only. The web app reads reels and dials a socket; it never writes to
+      # the repo, and a read-only mount is what makes that a fact rather than a
+      # promise.
+      - ${OPENBURROW_REPO_PATH:?set OPENBURROW_REPO_PATH}:/repo:ro
+    expose:
+      - "3000"
+    networks:
+      - frontend
+
+volumes:
+  pgdata:
+
+networks:
+  # Postgres and the relay only. The web app cannot reach the database, which is
+  # not a restriction anyone has to remember because there is no route.
+  backend:
+    internal: true
+  frontend:

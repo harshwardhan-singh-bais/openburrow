@@ -1,0 +1,80 @@
+# Development stack: relay + Postgres.
+#
+# This is NOT how you run OpenBurrow locally. A local session needs nothing but
+# Python, git, and uv — the daemon stores everything in a single SQLite file and
+# never touches Postgres. This compose file exists for developing and testing the
+# relay, which is the team feature.
+#
+#   docker compose -f docker/compose.dev.yml up -d
+#   burrow relay serve --port 8787
+#   docker compose -f docker/compose.dev.yml down
+#
+# Every variable below is named exactly as `openburrow/relay/config.py` reads it.
+# The prefix is load-bearing: `OPENBURROW_RELAY_` is the relay's *server* config.
+# The CLI's *client* settings (`OPENBURROW_RELAY_URL`, `_TOKEN`, `_ORG`) live under
+# the same prefix, which is why the relay's config explicitly ignores them rather
+# than reporting them as unknown variables on every boot.
+
+name: openburrow-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: openburrow
+      POSTGRES_PASSWORD: openburrow
+      POSTGRES_DB: openburrow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The relay must not start before the database can accept connections, and
+      # "the container is running" is not the same as "postgres is ready" —
+      # there is a window where the process is up and the socket refuses.
+      test: ["CMD-SHELL", "pg_isready -U openburrow -d openburrow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: relay
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      OPENBURROW_RELAY_DB_URL: postgresql+asyncpg://openburrow:openburrow@postgres:5432/openburrow
+      # Development-only secret. Production refuses to start without a real one —
+      # a relay with a default secret is not a relay with weak auth, it is a relay
+      # with no auth. The config refuses a secret under 32 bytes, so this value is
+      # long enough to be accepted and obviously wrong enough not to be shipped.
+      OPENBURROW_RELAY_JWT_SECRET: dev-only-not-for-production-do-not-ship-this
+      OPENBURROW_RELAY_LOG_LEVEL: DEBUG
+      OPENBURROW_RELAY_LOG_FORMAT: console
+      # The browser app is a different origin in development, and the relay
+      # refuses a cross-origin upgrade it was not told about.
+      OPENBURROW_RELAY_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      # The relay binds 0.0.0.0 here *only* because the container needs it to be
+      # reachable from the host. Outside a container it defaults to 127.0.0.1, and
+      # that default is the right one — `config.warnings()` reports a public bind
+      # without TLS, and this is a development stack.
+      OPENBURROW_RELAY_HOST: 0.0.0.0
+      OPENBURROW_RELAY_PORT: "8787"
+      # Zero retention in development. Nothing here is worth keeping and a
+      # long-lived volume between test runs makes a failing test look flaky.
+      OPENBURROW_RELAY_RETENTION_DAYS: "0"
+    ports:
+      - "8787:8787"
+    # No `serve` subcommand — the entry point is a flat argparse with `--host`
+    # and `--port`. The compose file previously said `serve`, which would have
+    # failed on every `up`.
+    command: ["--host", "0.0.0.0", "--port", "8787"]
+    # The image declares this against `/healthz`, which touches nothing. Wiring
+    # it to `/readyz` would make a Postgres blip restart the relay.
+
+volumes:
+  pgdata:

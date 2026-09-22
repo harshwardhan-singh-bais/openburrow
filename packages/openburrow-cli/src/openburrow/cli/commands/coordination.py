@@ -34,6 +34,7 @@ from openburrow.cli.output import (
     table,
     warn,
 )
+from openburrow.daemon.ipc import IpcClient
 
 app = typer.Typer(help="Claims, handoffs, and plan coordination.", no_args_is_help=True)
 plan_app = typer.Typer(help="Inspect and edit the session plan.", no_args_is_help=True)
@@ -68,6 +69,10 @@ def claim(
     lane: Annotated[str, typer.Option("--lane", "-l", help="Lane claiming the resource.")] = "",
     intent: Annotated[str, typer.Option("--intent", "-i", help="Why you want it.")] = "",
     ttl: Annotated[int, typer.Option("--ttl", help="Seconds until the claim expires.")] = 1800,
+    force: Annotated[
+        bool, typer.Option("--force", help="Admin override: take the claim from its holder.")
+    ] = False,
+    reason: Annotated[str, typer.Option("--reason", help="Why the force was necessary.")] = "",
 ) -> None:
     """Claim a file or path glob.
 
@@ -75,6 +80,11 @@ def claim(
     visible so another lane can react. Hard locks across heterogeneous harnesses
     would deadlock the moment one crashed, which is the failure this design
     deliberately avoids.
+
+    ``--force`` is the admin override (item 102): the holder's claim is released
+    and recorded as overridden, on the bus, under your name. It exists for the
+    case where the holder is gone; using it to win a contested claim is visible
+    to every teammate.
     """
     context: CliContext = ctx.obj
     client = asyncio.run(context.require_daemon())
@@ -88,10 +98,16 @@ def claim(
             resource=resource,
             intent=intent,
             ttl_seconds=ttl,
+            force=force,
+            reason=reason,
+            by=(context.config().settings.governance_human_id if force else ""),
         )
     )
 
     def render(result: dict) -> None:
+        if result.get("forced"):
+            warn(f"force-claimed {resource} (was held by {result.get('previous_holder')})")
+            return
         if result.get("conflict"):
             warn(f"'{resource}' is already claimed by {result.get('conflict_lane')}")
             if result.get("conflict_intent"):
@@ -254,6 +270,47 @@ def handoff(
     emit(context, data, human_renderer=render)
 
 
+@app.command("handoff-assign")
+def handoff_assign(
+    ctx: typer.Context,
+    step: Annotated[str, typer.Argument(help="Plan step id or title fragment.")],
+    teammate: Annotated[
+        str, typer.Argument(help="Teammate's subject (email or handle) — no harness needed.")
+    ],
+    session: Annotated[str, typer.Option("--session", "-s", help="Session id or name.")] = "",
+    reason: Annotated[str, typer.Option("--reason", help="Why the work is being reassigned.")] = "",
+) -> None:
+    """Assign a step to a teammate with no harness (item 100).
+
+    Ownership moves to a person and any live A2A task for the step is
+    cancelled, so no agent picks it up. Notifying the teammate is the
+    notifier's job — `burrow hook` or a channel webhook — not this command's.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(
+        client.call(
+            "handoff.assign",
+            session=session_id,
+            step=step,
+            teammate=teammate,
+            reason=reason,
+        )
+    )
+
+    def render(result: dict) -> None:
+        success(f"step '{step}' assigned to {result.get('assigned_to', teammate)}")
+        print_kv(
+            {
+                "from": result.get("from_lane") or "unowned",
+                "agent task cancelled": result.get("task_cancelled", False),
+            }
+        )
+
+    emit(context, data, human_renderer=render)
+
+
 # ---------------------------------------------------------------------------
 # Plan
 # ---------------------------------------------------------------------------
@@ -348,6 +405,52 @@ def plan_edit(
     raise typer.Exit(code=1)
 
 
+@plan_app.command("generate")
+def plan_generate(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session id or name.")] = "",
+    description: Annotated[
+        str, typer.Option("--description", "-d", help="Task description to plan from.")
+    ] = "",
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Add generated steps even when a plan already exists."),
+    ] = False,
+) -> None:
+    """Generate a fallback plan with the configured LLM (item 120).
+
+    Used when the harness produced no plan of its own. The result carries the
+    planner's honesty fields: a refused or unavailable run says so explicitly
+    rather than pretending the task needs no plan.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(
+        client.call(
+            "plan.generate",
+            session=session_id,
+            description=description,
+            force=force,
+        )
+    )
+
+    def render(d: dict) -> None:
+        if not d.get("generated"):
+            warn(f"not generated: {d.get('reason') or d.get('note') or 'unknown reason'}")
+            return
+        steps = d.get("steps") or []
+        success(f"generated {len(steps)} step(s)")
+        for index, step in enumerate(steps):
+            deps = step.get("depends_on") or []
+            dep_note = f"  [dim]after {len(deps)}[/dim]" if deps else ""
+            console.print(f"  {index}. {step.get('title', '')}{dep_note}")
+        if d.get("note"):
+            console.print(f"  [dim]{d['note']}[/dim]")
+
+    emit(context, data, human_renderer=render)
+
+
 @plan_app.command("diff")
 def plan_diff(
     ctx: typer.Context,
@@ -387,7 +490,7 @@ def _claim_step(context: CliContext, session: str, lane: str, step: str, *, kind
     return data
 
 
-def _latest_session(client) -> str:
+def _latest_session(client: IpcClient) -> str:
     sessions = asyncio.run(client.call("session.list", open_only=True))
     if not sessions:
         failure("no open sessions")

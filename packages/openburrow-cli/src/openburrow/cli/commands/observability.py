@@ -31,8 +31,9 @@ from openburrow.cli.output import (
     success,
     table,
 )
+from openburrow.daemon.ipc import IpcClient
 
-app = typer.Typer(help="Live view, logs, reports, and replay.", no_args_is_help=True)
+app = typer.Typer(help="Live view, logs, reports, replay, and standups.", no_args_is_help=True)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,53 @@ def watch(
 # ---------------------------------------------------------------------------
 # burrow logs
 # ---------------------------------------------------------------------------
+@app.command("message")
+def message(
+    ctx: typer.Context,
+    body: Annotated[str, typer.Argument(help="The message text.")],
+    subject: Annotated[str, typer.Option("--subject", help="One-line subject.")] = "",
+    lane: Annotated[
+        str, typer.Option("--lane", help="Send as a lane rather than as a human.")
+    ] = "",
+    intent: Annotated[
+        str,
+        typer.Option("--intent", help="inform|propose|counter|accept|reject|withdraw."),
+    ] = "inform",
+    recipient: Annotated[
+        list[str] | None,
+        typer.Option("--recipient", "-r", help="Target lane; repeat for several."),
+    ] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session id or name.")] = "",
+) -> None:
+    """Post a message onto the session thread, as a peer participant.
+
+    The human-override path: the message lands in the same append-only log every
+    lane reads, with the same shape as an A2A message, so a teammate typing into
+    the thread is indistinguishable in kind from a lane speaking. Without
+    ``--recipient`` it broadcasts to every lane in the session.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(
+        client.call(
+            "bus.message",
+            session=session_id,
+            body=body,
+            subject=subject,
+            lane=lane,
+            intent=intent,
+            recipients=list(recipient or []),
+        )
+    )
+
+    def render(result: dict) -> None:
+        success(f"delivered to {', '.join(result.get('recipients') or ['*'])}")
+        print_kv({"id": result.get("id"), "thread": result.get("thread_id")})
+
+    emit(context, data, human_renderer=render)
+
+
 @app.command("logs")
 def logs(
     ctx: typer.Context,
@@ -335,6 +383,58 @@ def replay(
         console.print("\n[dim]stopped[/dim]")
 
 
+@app.command("fork")
+def fork(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Argument(help="Session id or name.")],
+    at: Annotated[
+        int, typer.Option("--at", help="0-based timeline index of the message to change.")
+    ],
+    message: Annotated[str, typer.Option("--message", help="What the message says instead.")],
+    reason: Annotated[str, typer.Option("--reason", help="Why the fork exists.")] = "",
+) -> None:
+    """Fork-and-diverge: replay from a point with one message changed (item 155).
+
+    A read-only counterfactual over the causal log — the record is never
+    touched. Entries after the fork diverge when they causally depend on the
+    injected turn, so a changed negotiation move shows how the exchange (and
+    everything negotiated after it) would have gone differently.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    reel_dir = context.config().paths.reels_dir / session_id
+    timeline_path = reel_dir / "timeline.jsonl"
+    if not timeline_path.exists():
+        failure(
+            f"no timeline for {session_id} — run `burrow observability export {session_id}` first"
+        )
+        raise typer.Exit(code=1)
+
+    from openburrow.reel import ForkSpec, fork_report_text, run_fork
+
+    spec = ForkSpec(at_index=at, new_summary=message, reason=reason)
+    try:
+        forked, report = run_fork(timeline_path, spec)
+    except IndexError as exc:
+        failure(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if context.is_json:
+        emit(
+            context,
+            {
+                "forked_at": report.forked_at,
+                "shared": report.shared,
+                "diverged": report.diverged,
+                "diverged_entries": report.diverged_entries,
+                "comparisons": report.comparisons,
+            },
+        )
+        return
+    console.print(fork_report_text(forked, report))
+
+
 @app.command("tui")
 def tui(
     ctx: typer.Context,
@@ -354,7 +454,62 @@ def tui(
     BurrowTui(client, session_id).run()
 
 
-def _latest_session(client) -> str:
+@app.command("standup")
+def standup(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Argument(help="Session id or name.")] = "",
+    email: Annotated[
+        bool,
+        typer.Option(
+            "--email",
+            help="Also email the digest to the configured SMTP recipients (item 224).",
+        ),
+    ] = False,
+) -> None:
+    """Overnight summary: what agents did, said to each other, and governance.
+
+    Built from the append-only log (item 228), so it renders the same after the
+    session is closed — the standup exists precisely for the session nobody
+    watched live. With ``--email``, the same text is sent via the SMTP settings
+    before it is printed, so what lands in the inbox is what the terminal showed.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    report = asyncio.run(client.call("standup.generate", session=session_id))
+
+    if email:
+        from openburrow.cli.output import success, warn
+        from openburrow.daemon.notify import send_email_digest
+
+        settings = context.config(require_repo=False).settings
+        if not settings.email_digest_recipients:
+            warn("no email_digest_recipients configured — skipping the email copy")
+        else:
+            sent = send_email_digest(
+                report,
+                host=settings.smtp_host,
+                port=settings.smtp_port,
+                sender=settings.email_from,
+                recipients=list(settings.email_digest_recipients),
+                user=settings.smtp_user,
+                password=settings.smtp_password,
+                use_tls=settings.smtp_use_tls,
+            )
+            if sent:
+                success(f"emailed the digest to {sent} recipient(s)")
+            else:
+                warn("email send failed — see the daemon log")
+
+    def render(data: dict) -> None:
+        from openburrow.daemon.notify import render_standup_text
+
+        console.print(render_standup_text(data))
+
+    emit(context, report, human_renderer=render)
+
+
+def _latest_session(client: IpcClient) -> str:
     sessions = asyncio.run(client.call("session.list", open_only=True))
     if not sessions:
         failure("no open sessions")

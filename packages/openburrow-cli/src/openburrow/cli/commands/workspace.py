@@ -15,7 +15,7 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Protocol
 
 import typer
 
@@ -28,18 +28,21 @@ from openburrow.cli.output import (
     failure,
     info,
     print_kv,
+    render_error,
     section,
     success,
     table,
     warn,
 )
-from openburrow.core.config.load import load_config
+from openburrow.core.config.load import ResolvedConfig, load_config
+from openburrow.core.config.migrate import apply_migration, plan_migration
 from openburrow.core.config.repo_config import (
     LaneTemplate,
     ProjectConfig,
     RepoConfig,
     dump_repo_config,
 )
+from openburrow.core.config.settings import Settings
 from openburrow.core.errors import OpenBurrowError
 from openburrow.core.paths import (
     BurrowPaths,
@@ -48,6 +51,7 @@ from openburrow.core.paths import (
     find_repo_root_or_none,
 )
 from openburrow.core.version import __version__, version_info
+from openburrow.daemon.sandbox import plan as sandbox_plan
 
 app = typer.Typer(help="Workspace setup, diagnostics, and configuration.", no_args_is_help=True)
 
@@ -281,6 +285,117 @@ lands somewhere every tool benefits from — not in a format only one tool reads
 # ---------------------------------------------------------------------------
 # burrow doctor
 # ---------------------------------------------------------------------------
+def _sandbox_check(settings: Settings) -> tuple[bool, str]:
+    """The sandbox line for ``burrow doctor``.
+
+    A helper rather than inline, because ``doctor`` is a linear list of checks
+    and inlining this pushed it past the branch and statement limits the repo
+    deliberately keeps low. Extracting beats suppressing: the rule is what stops
+    a check list quietly becoming a control flow graph.
+
+    Reported as a **failure** when the backend cannot be used, not as a note.
+    ``sandbox.wrap`` refuses the spawn in that state, so a green tick here would
+    be the last thing a user saw before a confusing spawn error — and doctor
+    exists to be the place where the real cause is visible.
+
+    The detail names what is *enforced*, not what was configured. An operator who
+    set ``sandbox_network=allowlist`` on a backend that can only turn the network
+    off needs to learn that here rather than from a post-incident read of the
+    source.
+
+    Defined *above* the ``@app.command("doctor")`` decorator, and that placement
+    is load-bearing. When this was extracted it landed between the decorator and
+    the function it decorates, so Typer registered *this* helper as the ``doctor``
+    command and tried to build a Click parameter type for ``Settings`` — every
+    ``burrow`` invocation then died at parse time with ``RuntimeError: Type not
+    yet supported``. A decorator binds to the next definition, not the next
+    name that reads well.
+    """
+    described = sandbox_plan(settings)
+    if not described.enabled:
+        return True, "disabled — lanes spawn unsandboxed"
+    if not described.available:
+        return False, described.reason
+
+    parts = [described.backend]
+    if described.enforced:
+        parts.append(f"enforces {', '.join(described.enforced)}")
+    if described.unenforced:
+        parts.append(f"NOT enforced: {', '.join(described.unenforced)}")
+    return True, " · ".join(parts)
+
+
+def _config_row(config: ResolvedConfig) -> dict[str, object]:
+    """The ``openburrow.yaml`` row for ``burrow doctor``, which has three outcomes.
+
+    A helper rather than inline, for the reason ``_sandbox_check`` gives: the
+    branch and statement limits are what stop this command's linear list of
+    checks quietly becoming a control-flow graph.
+
+    The third outcome is the point. ``load_config`` falls back to built-in
+    defaults when the file is absent, so the call succeeding does not mean the
+    file is there. Reporting ``True`` unconditionally printed
+    ``✓ openburrow.yaml  /path/to/openburrow.yaml`` for a file that did not
+    exist — on the first command the README tells anyone to run, and the one
+    whose entire job is to say what is actually wrong.
+
+    Absent is not a failure: the defaults are valid, and CI relies on
+    ``doctor`` exiting 0 on a fresh checkout. So it gets the informational
+    marker (``ok: None``, rendered as ``·`` and left out of the pass count)
+    rather than a tick or a cross.
+    """
+    path = config.paths.config_file
+    if path.is_file():
+        return {"check": "openburrow.yaml", "ok": True, "detail": str(path), "fixable": False}
+    return {
+        "check": "openburrow.yaml",
+        "ok": None,
+        "detail": f"absent ({path}) — running on built-in defaults; `burrow init` writes it",
+        "fixable": False,
+    }
+
+
+class _Check(Protocol):
+    """The ``check`` closure ``doctor`` passes down to its helpers.
+
+    A protocol rather than ``Callable[[str, bool, str, bool], bool]``
+    because the closure has defaults and a ``Callable`` type cannot express
+    them: it describes four *required positional* parameters, so the three-
+    argument call for ``runtime writable`` is a type error against it.
+    """
+
+    def __call__(self, name: str, ok: bool, detail: str = "", fixable: bool = False) -> bool: ...
+
+
+def _path_checks(
+    check: _Check,
+    config: ResolvedConfig,
+    *,
+    fix: bool,
+) -> None:
+    """The four directory rows, plus whether the runtime dir is writable.
+
+    ``check`` is passed in rather than reimplemented here. A helper that built
+    the rows itself would report the same information and change what the
+    command does: ``check`` is also what records a failure in ``problems``, and
+    ``problems`` is what decides the exit code.
+    """
+    paths = config.paths
+    for label, directory in (
+        ("runtime dir", paths.runtime_dir),
+        ("global dir", paths.global_dir),
+        ("worktree root", paths.worktree_root),
+        ("cache dir", paths.cache_dir),
+    ):
+        exists = directory.exists()
+        if not exists and fix:
+            directory.mkdir(parents=True, exist_ok=True)
+            exists = True
+        check(label, exists, str(directory), fixable=True)
+
+    check("runtime writable", _is_writable(paths.runtime_dir), str(paths.runtime_dir))
+
+
 @app.command("doctor")
 def doctor(
     ctx: typer.Context,
@@ -325,29 +440,16 @@ def doctor(
     if repo_root is not None:
         try:
             config = load_config(repo_root)
-            check("openburrow.yaml", True, str(config.paths.config_file))
         except OpenBurrowError as exc:
             check("openburrow.yaml", False, str(getattr(exc, "message", exc)))
+        else:
+            results.append(_config_row(config))
     else:
         check("openburrow.yaml", False, "skipped — no repository")
 
     # --- 3. paths ----------------------------------------------------------
     if config is not None:
-        paths = config.paths
-        for label, directory in (
-            ("runtime dir", paths.runtime_dir),
-            ("global dir", paths.global_dir),
-            ("worktree root", paths.worktree_root),
-            ("cache dir", paths.cache_dir),
-        ):
-            exists = directory.exists()
-            if not exists and fix:
-                directory.mkdir(parents=True, exist_ok=True)
-                exists = True
-            check(label, exists, str(directory), fixable=True)
-
-        writable = _is_writable(paths.runtime_dir)
-        check("runtime writable", writable, str(paths.runtime_dir))
+        _path_checks(check, config, fix=fix)
 
     # --- 4. database -------------------------------------------------------
     if config is not None:
@@ -407,6 +509,10 @@ def doctor(
             bool(configured),
             ", ".join(configured) if configured else "none configured (Radar/classifier disabled)",
         )
+
+        # --- sandbox -------------------------------------------------------
+        sandbox_ok, sandbox_detail = _sandbox_check(config.settings)
+        check("sandbox", sandbox_ok, sandbox_detail)
 
     # --- 7. optional network ----------------------------------------------
     if network and config is not None:
@@ -553,6 +659,106 @@ def config_validate(ctx: typer.Context) -> None:
         raise typer.Exit(code=1)
 
 
+@config_app.command("migrate")
+def config_migrate(
+    ctx: typer.Context,
+    path: Annotated[
+        Path | None,
+        typer.Option("--path", help="Configuration file; defaults to this repo's."),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option("--write", help="Rewrite the file, keeping the previous one as .bak."),
+    ] = False,
+    check: Annotated[
+        bool,
+        typer.Option("--check", help="Exit non-zero if migration is needed. Writes nothing."),
+    ] = False,
+) -> None:
+    """Upgrade openburrow.yaml to the schema version this build understands.
+
+    Reports rather than rewrites unless --write is given, because the write is a
+    full re-serialisation and YAML comments do not survive it. --check is the same
+    plan with the exit code flipped, so CI can assert that the committed
+    configuration is current without owning a copy of it.
+    """
+    context: CliContext = ctx.obj
+    if write and check:
+        failure("--write and --check are opposites; pass one of them")
+        raise typer.Exit(code=2)
+
+    # The target path is derived without loading the configuration, and that is
+    # the whole point of this command: `burrow config migrate` exists to repair a
+    # file this build cannot parse, so routing the lookup through
+    # `context.config()` would make it fail for exactly the input it is for. It
+    # did — a repo whose `openburrow.yaml` declared a future schema version raised
+    # `ConfigSchemaError` while resolving the path, so the command named by that
+    # error's own hint could never run. `--path` stays as the override for a file
+    # that is somewhere other than the repo root.
+    target = (
+        path if path is not None else BurrowPaths.for_repo(context.repo_root_path()).config_file
+    )
+
+    try:
+        plan = plan_migration(target)
+    except OpenBurrowError as exc:
+        # One funnel call rather than `emit` plus a side-channel print, so
+        # `--json` gets the payload and the human path gets the formatted error
+        # with its hint, decided in the same place. `config validate` above does
+        # the second half separately, which is why its failure prints the error
+        # twice — worth aligning if either is touched again.
+        #
+        # Bound to a local because `except ... as exc` deletes the name when the
+        # handler ends, so a closure that captured it directly is a reference to
+        # a name the interpreter is about to unbind.
+        error = exc
+
+        def render_failure(_: object) -> None:
+            render_error(error)
+
+        emit(
+            context,
+            {
+                "path": str(target),
+                "needed": None,
+                "written": False,
+                "error": str(getattr(exc, "message", exc)),
+            },
+            human_renderer=render_failure,
+        )
+        raise typer.Exit(code=1) from exc
+
+    written = write and plan.needed
+    if written:
+        apply_migration(plan)
+
+    payload = {**plan.as_dict(), "written": written}
+
+    def render(data: dict) -> None:
+        section(str(data["path"]))
+        declared = data["declared"]
+        print_kv(
+            {
+                "declared": "absent" if declared is None else declared,
+                "supported": data["supported"],
+                "steps": ", ".join(str(step) for step in data["steps"]) or "—",
+            }
+        )
+        if data["unknown_keys"]:
+            warn("preserved, not interpreted by this build: " + ", ".join(data["unknown_keys"]))
+        if data["written"]:
+            success(f"migrated · previous file kept as {Path(str(data['path'])).name}.bak")
+        elif not data["needed"]:
+            success("already current")
+        else:
+            info("needs migrating; re-run with --write to apply")
+
+    emit(context, payload, human_renderer=render)
+
+    if check and plan.needed:
+        raise typer.Exit(code=1)
+
+
 # ---------------------------------------------------------------------------
 # burrow adapters
 # ---------------------------------------------------------------------------
@@ -624,6 +830,62 @@ def adapters_health(ctx: typer.Context) -> None:
             console.print(f"  {marker} {row['harness']:<14} [dim]{row['detail']}[/dim]")
 
     emit(context, results, human_renderer=render)
+
+
+# ---------------------------------------------------------------------------
+# burrow completion
+# ---------------------------------------------------------------------------
+@app.command("completion")
+def completion(
+    ctx: typer.Context,
+    shell: Annotated[
+        str,
+        typer.Argument(help="Target shell: bash, zsh, fish, or pwsh."),
+    ],
+) -> None:
+    """Print the shell completion script for the given shell.
+
+    Deliberately delegates to Click/Typer's own generator instead of shipping a
+    hand-written script: the generated code has to stay in lockstep with the
+    option names the framework parses, and two sources of that truth is how a
+    completion script starts suggesting flags that no longer exist.
+
+    Usage is printed rather than the script itself when the shell is unknown —
+    a completion script for the wrong shell silently does nothing once sourced,
+    which is worse than an error at request time.
+    """
+    from click.shell_completion import get_completion_class
+
+    # Click ships generators for exactly these three; `pwsh` is provided by
+    # Typer only when its optional `pwsh` extra is installed, so it is not
+    # offered here rather than offered and failing on a stock install.
+    supported = ("bash", "zsh", "fish")
+    if shell not in supported:
+        allowed = ", ".join(supported)
+        typer.echo(f"unknown shell {shell!r} — supported: {allowed}", err=True)
+        raise typer.Exit(code=2)
+
+    complete_cls = get_completion_class(shell)
+    if complete_cls is None:  # pragma: no cover - click returns None only for unknown shells
+        typer.echo(f"no completion support for {shell!r}", err=True)
+        raise typer.Exit(code=2)
+    # The instance is bound to the root `burrow` group (the command this one is
+    # running inside), so the generated script always describes the app that
+    # printed it rather than a snapshot that can drift from the real flags.
+    # `ctx.parent` is typed Optional but is never None inside a running
+    # subcommand — narrowing it here records that invariant for the reader too.
+    assert ctx.parent is not None
+    root_command = ctx.parent.command
+    complete = complete_cls(
+        # typer re-exports click's Command under its own module path, which
+        # mypy treats as a nominal mismatch even though it is the same class
+        # at runtime. Suppressing here rather than re-wrapping the object.
+        root_command,  # type: ignore[arg-type]
+        {},
+        "burrow",
+        "_BURROW_COMPLETE",
+    )
+    typer.echo(complete.source())
 
 
 # ---------------------------------------------------------------------------

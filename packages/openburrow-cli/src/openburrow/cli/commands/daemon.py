@@ -247,6 +247,51 @@ def status(ctx: typer.Context) -> None:
     emit(context, data, human_renderer=render)
 
 
+@app.command("health")
+def health(ctx: typer.Context) -> None:
+    """Deep health probe: database, adapters, bus, governance settings.
+
+    ``burrow daemon status`` answers *is it up*; this answers *is it well*. The
+    difference matters when a daemon answers pings but cannot serve — a wedged
+    database connection or a schema that drifted from the binary shows up here
+    as ``ok: false`` rather than as a mystery timeout in some other command.
+    """
+    context: CliContext = ctx.obj
+    client = context.daemon_client()
+
+    if not asyncio.run(client.ping()):
+        failure("daemon is not running")
+        info(f"endpoint: {client.paths.ipc_endpoint}")
+        raise typer.Exit(code=1)
+
+    data = asyncio.run(client.call("daemon.health"))
+
+    def render(result: dict) -> None:
+        db = result.get("database") or {}
+        bus = result.get("bus") or {}
+        gov = result.get("governance") or {}
+        banner(
+            "daemon health",
+            style="green" if db.get("ok") else "red",
+        )
+        print_kv(
+            {
+                "database": "ok" if db.get("ok") else f"unresponsive ({db.get('error')})",
+                "schema": db.get("schema_version"),
+                "journal": db.get("journal_mode"),
+                "bus subscribers": bus.get("subscribers", 0),
+                "adapters available": ", ".join(result.get("adapters") or []) or "none",
+                "governance": "enabled" if gov.get("enabled") else "disabled",
+                "max delegation depth": gov.get("max_delegation_depth"),
+            }
+        )
+        if not db.get("ok"):
+            raise typer.Exit(code=1)
+
+    emit(context, data, human_renderer=render)
+
+
+@app.command("logs")
 @app.command("logs")
 def logs(
     ctx: typer.Context,
@@ -293,10 +338,13 @@ def _read_pid(context: CliContext) -> int | None:
 def _kill(pid: int) -> None:
     import signal
 
+    # SIGKILL does not exist on Windows; mypy checks for the POSIX branch, so
+    # the attribute access is guarded the same way the runtime branch is.
+    sig = getattr(signal, "SIGKILL", signal.SIGTERM)
     # The process may already be gone. Killing a corpse is not an error when
     # the caller's intent is "make sure this is not running".
     with contextlib.suppress(OSError):
-        os.kill(pid, signal.SIGKILL if os.name != "nt" else signal.SIGTERM)
+        os.kill(pid, sig if os.name != "nt" else signal.SIGTERM)
 
 
 __all__ = ["app"]

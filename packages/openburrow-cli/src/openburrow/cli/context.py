@@ -100,17 +100,38 @@ class CliContext:
 
         The liveness check is a real ping rather than a PID file read, because a
         stale PID file is exactly the case where the naive check lies.
+
+        ``--no-daemon`` is honoured here, and honouring it means refusing. The
+        flag cannot conjure a local copy of live state: lanes, the bus, and the
+        Radar's memory of what it has already announced live only in the daemon.
+        Dialling anyway and then printing "commands that do not need live lanes
+        can run with --no-daemon" — which is what this method used to do — gave
+        the user a hint that was false for the command they had just run. The
+        honest behaviour is to stop and name the commands the flag really
+        applies to, which are the ones that never reach this method at all.
         """
         client = self.daemon_client()
         if self._daemon_checked:
             return client
 
+        if self.no_daemon:
+            raise DaemonNotRunningError(
+                "this command needs the daemon, and --no-daemon was given",
+                hint=(
+                    "--no-daemon applies to commands that read local files only: "
+                    "`burrow init`, `doctor`, `config`, `adapters`, `version`, and "
+                    "`burrow governance policy test`."
+                ),
+                context={"endpoint": client.paths.ipc_endpoint, "no_daemon": True},
+            )
+
         if not await client.ping():
             raise DaemonNotRunningError(
                 "the burrow daemon is not running",
                 hint=(
-                    "Start it with `burrow daemon start`. "
-                    "Commands that do not need live lanes can run with --no-daemon."
+                    "Start it with `burrow daemon start`. Commands that read local "
+                    "files only — `burrow init`, `doctor`, `config`, `adapters`, "
+                    "`version` — never need it."
                 ),
                 context={"endpoint": client.paths.ipc_endpoint},
             )

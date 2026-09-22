@@ -127,6 +127,7 @@ EPILOG = """\
   burrow doctor                     check the environment end to end
   burrow session start              bring up a session and its lanes
   burrow observability watch        follow what the lanes are doing
+  burrow radar scan                 see where two lanes are about to collide
 
 [bold]When something is wrong[/bold]
   burrow doctor --fix               repair what can be repaired automatically
@@ -272,6 +273,9 @@ app.add_typer(commands.coordination.app, name="coordination")
 app.add_typer(commands.governance.app, name="governance")
 app.add_typer(commands.knowledge.app, name="knowledge")
 app.add_typer(commands.observability.app, name="observability")
+app.add_typer(commands.radar.app, name="radar")
+app.add_typer(commands.integrations.app, name="hook")
+app.add_typer(commands.auth.app, name="login")
 
 
 # --------------------------------------------------------------------------

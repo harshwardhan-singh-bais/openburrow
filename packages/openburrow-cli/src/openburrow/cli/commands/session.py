@@ -31,6 +31,7 @@ from openburrow.cli.output import (
     table,
     warn,
 )
+from openburrow.daemon.ipc import IpcClient
 
 app = typer.Typer(help="Start, inspect, and close sessions.", no_args_is_help=True)
 lane_app = typer.Typer(help="Manage lanes within a session.", no_args_is_help=True)
@@ -40,6 +41,40 @@ app.add_typer(lane_app, name="lane")
 # ---------------------------------------------------------------------------
 # burrow session
 # ---------------------------------------------------------------------------
+@app.command("resume")
+def resume(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Argument(help="Session id or name.")] = "",
+) -> None:
+    """Resume a crashed or paused session from its checkpoints.
+
+    Lanes come back with the harness state their last checkpoint captured, where
+    the harness could honestly provide one; the report says which lanes resumed
+    and which came back fresh. Roadmap items 158/167 (Stage 12).
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    result = asyncio.run(client.call("session.resume", session=session_id))
+
+    def render(data: dict) -> None:
+        if data.get("resumed"):
+            section("Resumed from checkpoints")
+            for entry in data["resumed"]:
+                lane = entry.get("lane_name") or entry.get("lane_id", "")
+                success(
+                    f"{lane}: checkpoint seq={entry.get('sequence')} "
+                    f"(bus seq {entry.get('from_bus_seq')})"
+                )
+        if data.get("fresh"):
+            section("Came back fresh")
+            for entry in data["fresh"]:
+                warn(f"{entry.get('lane_id', '')}: {entry.get('reason', '')}")
+        info(data.get("message", ""))
+
+    emit(context, result, human_renderer=render)
+
+
 @app.command("start")
 def start(
     ctx: typer.Context,
@@ -390,7 +425,7 @@ def ask(
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-def _latest_session(client) -> str:
+def _latest_session(client: IpcClient) -> str:
     sessions = asyncio.run(client.call("session.list", open_only=True))
     if not sessions:
         failure("no open sessions")

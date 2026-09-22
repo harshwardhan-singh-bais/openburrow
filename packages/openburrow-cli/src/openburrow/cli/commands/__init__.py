@@ -18,21 +18,27 @@ why ``burrow --help`` stays fast.
 """
 
 from openburrow.cli.commands import (
+    auth,
     coordination,
     daemon,
     governance,
+    integrations,
     knowledge,
     observability,
+    radar,
     session,
     workspace,
 )
 
 __all__ = [
+    "auth",
     "coordination",
     "daemon",
     "governance",
+    "integrations",
     "knowledge",
     "observability",
+    "radar",
     "session",
     "workspace",
 ]

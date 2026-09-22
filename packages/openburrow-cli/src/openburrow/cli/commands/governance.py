@@ -28,6 +28,7 @@ from openburrow.cli.output import (
     table,
     warn,
 )
+from openburrow.daemon.ipc import IpcClient
 from openburrow.governance import PolicyGate
 
 app = typer.Typer(help="Audit, approvals, and policy enforcement.", no_args_is_help=True)
@@ -35,6 +36,48 @@ approvals_app = typer.Typer(help="Respond to pending approvals.", no_args_is_hel
 policy_app = typer.Typer(help="Inspect and test the policy gate.", no_args_is_help=True)
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(policy_app, name="policy")
+
+
+@app.command("scorecard")
+def scorecard(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Argument(help="Session id or name.")] = "",
+) -> None:
+    """ "Attacks caught" — flags raised vs. refused, per attack family (item 207).
+
+    A family with zero flags means nobody probed it, not that it is safe. Flags
+    are detections; refusals are enforcement actions — the distinction the
+    detection/enforcement split (ADR 0009) is built on.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(client.call("governance.scorecard", session=session_id))
+
+    def render(result: dict) -> None:
+        totals = result.get("totals") or {}
+        section("Attacks caught")
+        print_kv(
+            {
+                "flags raised": totals.get("flags", 0),
+                "refused": totals.get("refused", 0),
+            }
+        )
+        families = result.get("families") or {}
+        table(
+            ["attack family", "flags", "refused"],
+            [
+                [
+                    truncate(str(family.get("description", name)), 46),
+                    family.get("flags", 0),
+                    family.get("refused", 0),
+                ]
+                for name, family in families.items()
+            ],
+            caption=result.get("note", ""),
+        )
+
+    emit(context, data, human_renderer=render)
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +432,7 @@ def policy_test(
     emit(context, payload, human_renderer=render)
 
 
-def _latest_session(client) -> str:
+def _latest_session(client: IpcClient) -> str:
     sessions = asyncio.run(client.call("session.list", open_only=True))
     if not sessions:
         failure("no open sessions")

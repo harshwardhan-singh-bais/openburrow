@@ -33,6 +33,7 @@ from openburrow.cli.output import (
     success,
     table,
 )
+from openburrow.daemon.ipc import IpcClient
 
 app = typer.Typer(help="Shared Brain and lesson propagation.", no_args_is_help=True)
 brain_app = typer.Typer(
@@ -171,6 +172,39 @@ def brain_export(
     )
 
 
+@brain_app.command("refresh-stale")
+def brain_refresh_stale(
+    ctx: typer.Context,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session id or name.")] = "",
+) -> None:
+    """Sweep the Brain for drift and ask a nearby lane to re-check stale entries.
+
+    Staleness is git-derived: an entry anchored to a file the commits have moved
+    is a claim whose evidence expired. The nearest idle or working lane is asked
+    — as a question, not an instruction — to confirm or rewrite it.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(client.call("brain.refresh_stale", session=session_id))
+
+    def render(result: dict) -> None:
+        if not result.get("stale"):
+            success("no stale entries — every anchor still holds")
+            return
+        section(f"{result['stale']} stale entr{'y' if result['stale'] == 1 else 'ies'}")
+        for prompt in result.get("prompts") or []:
+            delivered = "asked" if prompt.get("delivered") else "not delivered"
+            console.print(
+                f"  {truncate(str(prompt.get('title', '')), 46)} "
+                f"[dim]({prompt.get('anchor_path', '')}) — {delivered}"
+                + (f" to {prompt.get('target_lane', '')}" if prompt.get("target_lane") else "")
+                + "[/dim]"
+            )
+
+    emit(context, data, human_renderer=render)
+
+
 @brain_app.command("diff")
 def brain_diff(
     ctx: typer.Context,
@@ -250,7 +284,53 @@ def lessons_retire(
     emit(context, data, human_renderer=lambda _d: success("lesson retired"))
 
 
-def _latest_session(client) -> str:
+@lessons_app.command("promote")
+def lessons_promote(
+    ctx: typer.Context,
+    title: Annotated[str, typer.Argument(help="One-line summary of the lesson.")],
+    body: Annotated[str, typer.Option("--body", "-b", help="The detail: what happened.")] = "",
+    trigger: Annotated[
+        str, typer.Option("--trigger", help="When to apply it: the situation to recognise.")
+    ] = "",
+    remedy: Annotated[
+        str, typer.Option("--remedy", help="What to do when the trigger fires.")
+    ] = "",
+    scope: Annotated[str, typer.Option("--scope", help="session|repo|org.")] = "session",
+    ttl_days: Annotated[int | None, typer.Option("--ttl-days", help="Days until expiry.")] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session id or name.")] = "",
+) -> None:
+    """Promote text to a lesson so other lanes inherit it.
+
+    Goes through the poisoned-lesson detector before it is stored: a lesson is a
+    prompt fragment injected into every lane's context, so this command is the
+    one place a human can (accidentally) inject into every harness at once.
+    A flagged candidate is refused and reported, not stored.
+    """
+    context: CliContext = ctx.obj
+    client = asyncio.run(context.require_daemon())
+    session_id = session or _latest_session(client)
+    data = asyncio.run(
+        client.call(
+            "lessons.promote",
+            session=session_id,
+            title=title,
+            body=body,
+            trigger=trigger,
+            remedy=remedy,
+            scope=scope,
+            ttl_days=ttl_days,
+            promoted_by="human",
+        )
+    )
+
+    def render(result: dict) -> None:
+        success(f"lesson promoted ({result.get('scope')}) — {result.get('title')}")
+        print_kv({"id": result.get("id")})
+
+    emit(context, data, human_renderer=render)
+
+
+def _latest_session(client: IpcClient) -> str:
     sessions = asyncio.run(client.call("session.list", open_only=True))
     if not sessions:
         failure("no open sessions")

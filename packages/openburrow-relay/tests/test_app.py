@@ -13,6 +13,7 @@ The endpoints that need real rows are marked ``integration`` and live in
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -140,7 +141,7 @@ class TestAuthRequired:
         # A body is supplied for POSTs so that auth is reached before body
         # validation. Otherwise a missing token would report as a 422, which is
         # technically true and completely useless to the caller.
-        kwargs = {"json": {}} if method == "post" else {}
+        kwargs: dict[str, Any] = {"json": {}} if method == "post" else {}
         response = getattr(client, method)(path, **kwargs)
         assert response.status_code == 401
         error = response.json()["error"]

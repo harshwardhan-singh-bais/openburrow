@@ -35,9 +35,10 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlmodel import SQLModel, select
+from sqlmodel import SQLModel, col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from openburrow.core.db.sqlmodel_compat import rows_changed, table_of
 from openburrow.core.logging import get_logger
 from openburrow.relay.config import RelaySettings
 from openburrow.relay.errors import (
@@ -204,11 +205,11 @@ class RelayStore:
         if self._engine is None:
             raise StorageUnavailableError("cannot create schema before connect()")
         tables = [
-            Room.__table__,
-            Member.__table__,
-            Invite.__table__,
-            RelayEvent.__table__,
-            DocSnapshot.__table__,
+            table_of(Room),
+            table_of(Member),
+            table_of(Invite),
+            table_of(RelayEvent),
+            table_of(DocSnapshot),
         ]
         async with self._engine.begin() as conn:
             await conn.run_sync(
@@ -318,7 +319,9 @@ class RelayStore:
     async def find_room_by_slug(self, repo_slug: str) -> Room | None:
         async with self.session() as session:
             result = await session.exec(
-                select(Room).where(Room.repo_slug == repo_slug).order_by(Room.created_at.desc())
+                select(Room)
+                .where(col(Room.repo_slug) == repo_slug)
+                .order_by(col(Room.created_at).desc())
             )
             return result.first()
 
@@ -327,9 +330,9 @@ class RelayStore:
         async with self.session() as session:
             result = await session.exec(
                 select(Room)
-                .join(Member, Member.room_id == Room.id)
-                .where(Member.subject == subject)
-                .order_by(Room.created_at.desc())
+                .join(Member, col(Member.room_id) == Room.id)
+                .where(col(Member.subject) == subject)
+                .order_by(col(Room.created_at).desc())
             )
             return list(result.all())
 
@@ -363,7 +366,7 @@ class RelayStore:
         now = datetime.now(UTC)
         async with self.session() as session:
             result = await session.exec(
-                select(Member).where(Member.room_id == room_id, Member.subject == subject)
+                select(Member).where(col(Member.room_id) == room_id, col(Member.subject) == subject)
             )
             existing = result.first()
             if existing is not None:
@@ -402,14 +405,28 @@ class RelayStore:
     async def get_member(self, room_id: str, subject: str) -> Member | None:
         async with self.session() as session:
             result = await session.exec(
-                select(Member).where(Member.room_id == room_id, Member.subject == subject)
+                select(Member).where(col(Member.room_id) == room_id, col(Member.subject) == subject)
+            )
+            return result.first()
+
+    async def get_member_by_subject(self, subject: str) -> Member | None:
+        """Any membership held by this subject, used by SSH-key auth (item 243).
+
+        The subject there is a derived key fingerprint, so "any room" is the
+        right scope: identity is global to the key, membership granularity comes
+        from the room the owner admitted it to. Ties resolve to the earliest
+        join, which makes the choice deterministic across a multi-room member.
+        """
+        async with self.session() as session:
+            result = await session.exec(
+                select(Member).where(col(Member.subject) == subject).order_by(col(Member.joined_at))
             )
             return result.first()
 
     async def list_members(self, room_id: str) -> list[Member]:
         async with self.session() as session:
             result = await session.exec(
-                select(Member).where(Member.room_id == room_id).order_by(Member.joined_at)
+                select(Member).where(col(Member.room_id) == room_id).order_by(col(Member.joined_at))
             )
             return list(result.all())
 
@@ -479,7 +496,7 @@ class RelayStore:
         digest = invite_lookup_hash(token)
         async with self.session() as session:
             result = await session.exec(
-                select(Invite).where(Invite.token_hash == digest).with_for_update()
+                select(Invite).where(col(Invite.token_hash) == digest).with_for_update()
             )
             invite = result.first()
             if invite is None:
@@ -522,7 +539,9 @@ class RelayStore:
     async def list_invites(self, room_id: str) -> list[Invite]:
         async with self.session() as session:
             result = await session.exec(
-                select(Invite).where(Invite.room_id == room_id).order_by(Invite.created_at.desc())
+                select(Invite)
+                .where(col(Invite.room_id) == room_id)
+                .order_by(col(Invite.created_at).desc())
             )
             return list(result.all())
 
@@ -573,11 +592,11 @@ class RelayStore:
             return result
 
         stmt = (
-            pg_insert(RelayEvent.__table__)
+            pg_insert(table_of(RelayEvent))
             .values(rows)
             # The whole point: a reconnect-and-replay is free.
             .on_conflict_do_nothing(constraint="uq_relay_event_origin")
-            .returning(RelayEvent.__table__.c.id)
+            .returning(table_of(RelayEvent).c.id)
         )
         async with self.session() as session:
             inserted = await session.execute(stmt)
@@ -614,23 +633,24 @@ class RelayStore:
         would never be told repo B existed.
         """
         limit = max(1, min(limit, MAX_TAIL_LIMIT))
-        stmt = select(RelayEvent).where(RelayEvent.room_id == room_id)
+        stmt = select(RelayEvent).where(col(RelayEvent.room_id) == room_id)
 
         since = since or {}
         if since:
-            thresholds = [(RelayEvent.origin_repo == repo, seq) for repo, seq in since.items()]
+            thresholds = [(col(RelayEvent.origin_repo) == repo, seq) for repo, seq in since.items()]
             stmt = stmt.where(
-                RelayEvent.origin_seq > case(*thresholds, value=RelayEvent.origin_repo, else_=0)
+                col(RelayEvent.origin_seq)
+                > case(*thresholds, value=RelayEvent.origin_repo, else_=0)
             )
 
         if session_id:
-            stmt = stmt.where(RelayEvent.session_id == session_id)
+            stmt = stmt.where(col(RelayEvent.session_id) == session_id)
         if event_types:
-            stmt = stmt.where(RelayEvent.event_type.in_(list(event_types)))
+            stmt = stmt.where(col(RelayEvent.event_type).in_(list(event_types)))
 
         # Ordered per origin. There is deliberately no global ordering to offer,
         # and sorting by `received_at` would imply one.
-        stmt = stmt.order_by(RelayEvent.origin_repo, RelayEvent.origin_seq).limit(limit)
+        stmt = stmt.order_by(col(RelayEvent.origin_repo), col(RelayEvent.origin_seq)).limit(limit)
 
         async with self.session() as session:
             result = await session.exec(stmt)
@@ -643,9 +663,9 @@ class RelayStore:
         and what a lag notice points at.
         """
         stmt = (
-            sa_select(RelayEvent.origin_repo, func.max(RelayEvent.origin_seq))
-            .where(RelayEvent.room_id == room_id)
-            .group_by(RelayEvent.origin_repo)
+            sa_select(col(RelayEvent.origin_repo), func.max(col(RelayEvent.origin_seq)))
+            .where(col(RelayEvent.room_id) == room_id)
+            .group_by(col(RelayEvent.origin_repo))
         )
         async with self.session() as session:
             result = await session.execute(stmt)
@@ -654,8 +674,8 @@ class RelayStore:
     async def event_count(self, room_id: str) -> int:
         stmt = (
             sa_select(func.count())
-            .select_from(RelayEvent.__table__)
-            .where(RelayEvent.__table__.c.room_id == room_id)
+            .select_from(table_of(RelayEvent))
+            .where(table_of(RelayEvent).c.room_id == room_id)
         )
         async with self.session() as session:
             result = await session.execute(stmt)
@@ -716,12 +736,12 @@ class RelayStore:
                 if room.retention_days <= 0:
                     continue
                 cutoff = now - timedelta(days=room.retention_days)
-                stmt = delete(RelayEvent.__table__).where(
-                    RelayEvent.__table__.c.room_id == room.id,
-                    RelayEvent.__table__.c.received_at < cutoff,
+                stmt = delete(table_of(RelayEvent)).where(
+                    table_of(RelayEvent).c.room_id == room.id,
+                    table_of(RelayEvent).c.received_at < cutoff,
                 )
                 result = await session.execute(stmt)
-                removed += int(result.rowcount or 0)
+                removed += int(rows_changed(result) or 0)
             await session.commit()
         if removed:
             log.info("relay.pruned", events=removed)
@@ -749,9 +769,14 @@ def _normalise_event(  # noqa: PLR0911 - one early return per distinct rejection
     if not origin_repo:
         return {}, {"reason": "missing_origin_repo"}
 
+    raw_seq = raw.get("origin_seq")
+    if raw_seq is None:
+        return {}, {"reason": "missing_origin_seq", "origin_repo": origin_repo}
     try:
-        origin_seq = int(raw.get("origin_seq"))
+        origin_seq = int(raw_seq)
     except (TypeError, ValueError):
+        # A non-numeric sequence is the same defect as an absent one: the
+        # payload does not carry an origin position we can place.
         return {}, {"reason": "missing_origin_seq", "origin_repo": origin_repo}
     if origin_seq <= 0:
         # A zero or negative sequence is not an event the bus can produce, and

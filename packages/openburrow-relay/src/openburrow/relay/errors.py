@@ -11,6 +11,8 @@ that is plainly a 403, which is a bad bug to ship.
 
 from __future__ import annotations
 
+from typing import Any
+
 from openburrow.core.errors import OpenBurrowError
 
 
@@ -90,7 +92,7 @@ class RateLimitedError(RelayError):
     code = "openburrow.relay_rate_limited"
     status_code = 429
 
-    def __init__(self, message: str, *, retry_after: float, **kwargs) -> None:
+    def __init__(self, message: str, *, retry_after: float, **kwargs: Any) -> None:
         super().__init__(message, **kwargs)
         self.retry_after = retry_after
         self.context.setdefault("retry_after_s", round(retry_after, 3))

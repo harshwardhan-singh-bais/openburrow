@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -35,7 +36,7 @@ def small_hub(settings_factory: Callable[..., RelaySettings]) -> Hub:
     return Hub(settings_factory(OUTBOUND_QUEUE_SIZE="2"), metrics=build_metrics())
 
 
-def admit(hub: Hub, *, room: str = ROOM, member: str = "mbr_a", kind: str = "events"):
+def admit(hub: Hub, *, room: str = ROOM, member: str = "mbr_a", kind: str = "events") -> Any:
     return hub.admit(
         kind=kind, room=room, member=member, subject=f"{member}@example.com", role=RoomRole.VIEWER
     )

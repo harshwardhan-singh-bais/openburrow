@@ -57,6 +57,11 @@ from openburrow.relay.security import (
     TokenClaims,
     extract_bearer,
     issue_token,
+    new_ssh_challenge,
+    provenance_extension,
+    ssh_fingerprint,
+    verify_ssh_challenge,
+    verify_ssh_signature,
     verify_token,
 )
 from openburrow.relay.state import AppState
@@ -156,6 +161,17 @@ class RedeemRequest(BaseModel):
     display_name: str = Field(default="", max_length=200)
 
 
+class SshChallengeRequest(BaseModel):
+    public_key: str = Field(min_length=1, max_length=4096)
+
+
+class SshAuthRequest(BaseModel):
+    public_key: str = Field(min_length=1, max_length=4096)
+    challenge: str = Field(min_length=8, max_length=1024)
+    signature: str = Field(min_length=8, max_length=8192)
+    display_name: str = Field(default="", max_length=200)
+
+
 class CreateRoomRequest(BaseModel):
     repo_slug: str = Field(min_length=1, max_length=300)
     name: str = Field(default="", max_length=200)
@@ -231,6 +247,110 @@ async def auth_token(request: Request, body: RedeemRequest) -> dict[str, Any]:
         "member": {
             "id": member.id,
             "subject": member.subject,
+            "display_name": member.display_name,
+            "role": str(member.room_role),
+        },
+        "expires_at": claims.expires_at,
+        "expires_in_s": claims.ttl_remaining,
+    }
+
+
+# ==========================================================================
+# SSH-key identity (item 243)
+# ==========================================================================
+@router.post("/auth/ssh/challenge")
+async def ssh_challenge(request: Request, body: SshChallengeRequest) -> dict[str, Any]:
+    """Mint a challenge for the caller to sign with their SSH key.
+
+    Stateless: the challenge carries an HMAC over its nonce and expiry keyed
+    with the JWT secret, so verification needs no challenge store. The public
+    key is not validated here — an unparseable key simply cannot produce a
+    signature the auth step will accept, and telling an attacker their key is
+    malformed is free reconnaissance.
+    """
+    state = state_of(request)
+    client = _client_key(request)
+    bucket = state.http_buckets.get(client)
+    if not bucket.allow():
+        state.metrics.rate_limited.labels(surface="ssh-challenge").inc()
+        raise RateLimitedError(
+            "too many challenge requests",
+            retry_after=bucket.retry_after(),
+            hint="Wait and retry. Challenge requests are limited per client address.",
+        )
+    challenge, expires = new_ssh_challenge(secret=state.settings.jwt_secret)
+    return {
+        "challenge": challenge,
+        "expires_at": expires,
+        "fingerprint": ssh_fingerprint(body.public_key),
+        "hint": (
+            "Sign with: ssh-keygen -Y sign -f <key> <challenge-file>, then POST "
+            "the base64 signature to /auth/ssh/auth."
+        ),
+    }
+
+
+@router.post("/auth/ssh/auth")
+async def ssh_auth(request: Request, body: SshAuthRequest) -> dict[str, Any]:
+    """Exchange a signed SSH challenge for a room token.
+
+    Trust order matters: the challenge is verified first (proves the relay
+    minted it and it is fresh), then the signature (proves the caller holds the
+    private key), and only then is membership granted — to the *fingerprint*, a
+    derived identity, never to a name the caller typed. A key the room owner has
+    not admitted fails here even with a valid signature.
+    """
+    state = state_of(request)
+    client = _client_key(request)
+    bucket = state.http_buckets.get(client)
+    if not bucket.allow():
+        state.metrics.rate_limited.labels(surface="ssh-auth").inc()
+        raise RateLimitedError(
+            "too many auth requests",
+            retry_after=bucket.retry_after(),
+            hint="Wait and retry. Auth requests are limited per client address.",
+        )
+
+    verify_ssh_challenge(body.challenge, secret=state.settings.jwt_secret)
+    if not verify_ssh_signature(body.public_key, body.challenge, body.signature):
+        state.metrics.auth_failures.labels(reason="ssh_signature").inc()
+        raise AuthError(
+            "signature does not verify against the presented key",
+            hint="Sign the challenge bytes exactly as issued, with the matching private key.",
+        )
+
+    subject = ssh_fingerprint(body.public_key)
+    if not subject:
+        state.metrics.auth_failures.labels(reason="ssh_key_unparseable").inc()
+        raise AuthError("public key could not be parsed")
+
+    member = await state.store.get_member_by_subject(subject)
+    if member is None:
+        state.metrics.auth_failures.labels(reason="ssh_key_unknown").inc()
+        raise AuthError(
+            "this key has not been admitted to any room",
+            hint="A room owner must create an invite or membership for this key's fingerprint first.",
+            context={"fingerprint": subject},
+        )
+
+    room = await state.store.require_room(member.room_id)
+    token, claims = issue_token(
+        state.settings,
+        room=room.id,
+        member=member.id,
+        subject=subject,
+        role=member.room_role,
+    )
+    state.metrics.tokens_issued.inc()
+    log.info("relay.ssh_auth", room=room.id, member=member.id, subject=subject[:32])
+    return {
+        "token": token,
+        "token_type": "Bearer",
+        "provenance": provenance_extension(claims)["provenance"],
+        "room": {"id": room.id, "repo_slug": room.repo_slug, "name": room.name},
+        "member": {
+            "id": member.id,
+            "subject": subject,
             "display_name": member.display_name,
             "role": str(member.room_role),
         },
@@ -1165,6 +1285,11 @@ async def _fan_out(
 
     for row in result.accepted_events:
         occurred = row.get("occurred_at")
+        # `hasattr` does not narrow `Any | None`, and the None case is
+        # real: a row whose timestamp was never written.
+        occurred_at = occurred
+        if occurred is not None and hasattr(occurred, "isoformat"):
+            occurred_at = occurred.isoformat()
         state.hub.publish(
             room_id,
             {
@@ -1176,7 +1301,7 @@ async def _fan_out(
                 "lane_id": row.get("lane_id"),
                 "summary": row.get("summary"),
                 "payload": row.get("payload") or {},
-                "occurred_at": occurred.isoformat() if hasattr(occurred, "isoformat") else occurred,
+                "occurred_at": occurred_at,
             },
             kind="events",
             exclude=exclude,

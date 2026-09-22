@@ -23,10 +23,19 @@ class TestTokenBucket:
         assert bucket.allow() is False
 
     def test_refills_over_time(self) -> None:
+        # The clock is injected rather than slept against: at 1000/s, 1ms of
+        # real time between the two allow() calls below is already a full
+        # token, and pauses of that length (GC, thread scheduling) made this
+        # test flake. Backdating `_refill` tests the same refill math
+        # deterministically on every platform.
         bucket = TokenBucket(rate=1000.0, burst=1)
+        # Start full.
+        bucket._refill(now=bucket._updated + 1.0)
         assert bucket.allow() is True
+        # `_updated` now sits a second in the future, so real elapsed time is
+        # negative and no refill can sneak in before the next assertion.
         assert bucket.allow() is False
-        time.sleep(0.01)  # 1000/s => 10 tokens in 10ms, capped at burst
+        bucket._refill(now=bucket._updated + 0.01)  # 1000/s => 10 tokens, capped at burst
         assert bucket.allow() is True
 
     def test_never_exceeds_burst(self) -> None:
@@ -103,7 +112,12 @@ class TestBucketRegistry:
         registry.get("a")
         registry.get("b")
         assert len(registry) == 2
-        time.sleep(0.001)
+        # Backdate instead of sleeping: Windows `time.monotonic` on Python 3.12
+        # ticks at ~15.6ms granularity, so a 1ms sleep can leave elapsed at 0.0
+        # and nothing would be evicted. Backdating tests the eviction logic
+        # itself, deterministically on every platform.
+        for key in registry._touched:
+            registry._touched[key] -= 1.0
         assert registry.sweep() == 2
         assert len(registry) == 0
 

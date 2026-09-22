@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from openburrow.a2a.transport import (
+    coerce_task_payload,
     make_request,
 )
 from openburrow.core.errors import A2AProtocolError, ConformanceError
@@ -235,7 +236,11 @@ class PeerClient:
             log.debug("a2a.message.absorbed", peer=self.base_url, message_id=message.id)
             return None
 
-        task = A2ATask.model_validate(task_payload)
+        # A third-party peer emits camelCase (the A2A wire shape); OpenBurrow's
+        # own server emits snake_case. coerce_task_payload accepts both, which
+        # is the difference between speaking A2A and only speaking to
+        # ourselves. Unknown keys still fail validation downstream.
+        task = A2ATask.model_validate(coerce_task_payload(task_payload))
         log.info(
             "a2a.message.delivered",
             peer=self.base_url,
@@ -251,14 +256,14 @@ class PeerClient:
         except A2AProtocolError as exc:
             log.debug("a2a.task.fetch_failed", task_id=task_id, error=str(exc))
             return None
-        return A2ATask.model_validate(payload)
+        return A2ATask.model_validate(coerce_task_payload(payload))
 
     async def cancel_task(self, task_id: str, reason: str = "") -> A2ATask | None:
         try:
             payload = await self.call("tasks/cancel", {"id": task_id, "reason": reason})
         except A2AProtocolError:
             return None
-        return A2ATask.model_validate(payload)
+        return A2ATask.model_validate(coerce_task_payload(payload))
 
     async def delegate_task(
         self,

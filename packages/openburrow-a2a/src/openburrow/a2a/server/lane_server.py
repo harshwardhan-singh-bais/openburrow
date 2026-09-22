@@ -33,6 +33,8 @@ from openburrow.a2a.card import HarnessCapabilities, SkillSpec, build_agent_card
 from openburrow.a2a.transport import (
     INTERNAL_ERROR,
     INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
     TASK_NOT_FOUND,
     JsonRpcError,
     JsonRpcRequest,
@@ -143,9 +145,11 @@ class LaneA2AServer:
         """Bind the port and begin serving. Resolves an ephemeral port if 0."""
         import uvicorn
 
-        self.build_app()
+        # The return value, not the attribute: `_app` is `Starlette | None`
+        # until build_app has run, and it is the same object either way.
+        app = self.build_app()
         config = uvicorn.Config(
-            self._app,
+            app,
             host=self.host,
             port=self.port,
             log_level="warning",
@@ -217,8 +221,13 @@ class LaneA2AServer:
         try:
             payload = await request.json()
         except Exception as exc:
+            # JSON-RPC 2.0 separates "the body is not JSON at all" (-32700
+            # PARSE_ERROR) from "the JSON is not a valid request" (-32600
+            # INVALID_REQUEST). They were both mapped to -32600, which a
+            # spec-following client cannot distinguish from a malformed
+            # request object — the distinction the interop suite asserts.
             return JSONResponse(
-                make_error(INVALID_REQUEST, f"body is not JSON: {exc}", request_id=None),
+                make_error(PARSE_ERROR, f"body is not JSON: {exc}", request_id=None),
                 status_code=400,
             )
 
@@ -277,7 +286,7 @@ class LaneA2AServer:
         raise A2AProtocolError(
             f"unknown method {method!r}",
             hint="See A2A_METHODS for the supported set.",
-            context={"method": method},
+            context={"method": method, "code": METHOD_NOT_FOUND},
         )
 
     async def _method_message_send(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -391,7 +400,11 @@ class LaneA2AServer:
                     except TimeoutError:
                         yield ": keepalive\n\n"
                         continue
-                    yield sse_frame(frame.get("data"), event=frame.get("event", "message"))
+                    data = frame.get("data")
+                    yield sse_frame(
+                        {} if data is None else data,
+                        event=frame.get("event", "message"),
+                    )
                     if frame.get("event") == "closed":
                         break
             finally:

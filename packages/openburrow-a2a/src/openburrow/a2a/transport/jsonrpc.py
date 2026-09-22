@@ -21,6 +21,7 @@ Methods implemented, matching A2A's surface:
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -124,12 +125,31 @@ class JsonRpcError:
         Doing this in one place is what keeps error handling honest across the
         wire: a caller gets a stable code it can branch on, not a stack trace
         wrapped in a string.
+
+        An ``A2AProtocolError`` raised with ``context={"code": <A2A code>}``
+        keeps that code. The lane server uses this for the A2A-specific errors
+        the spec names — an unknown task is -32001 (TASK_NOT_FOUND), not the
+        generic -32602 INVALID_PARAMS it silently mapped to for every pass
+        before the interop suite ran a client that branched on the code.
         """
         from openburrow.core.errors import IllegalTaskTransitionError
+
+        a2a_specific = frozenset(
+            {
+                METHOD_NOT_FOUND,
+                TASK_NOT_FOUND,
+                TASK_NOT_CANCELABLE,
+                PUSH_NOT_SUPPORTED,
+                UNSUPPORTED_OPERATION,
+            }
+        )
 
         if isinstance(exc, IllegalTaskTransitionError):
             return cls(TASK_NOT_CANCELABLE, str(exc.message), exc.context or None)
         if isinstance(exc, A2AProtocolError):
+            requested = (exc.context or {}).get("code")
+            if isinstance(requested, int) and requested in a2a_specific:
+                return cls(requested, str(exc.message), exc.context or None)
             return cls(INVALID_PARAMS, str(exc.message), exc.context or None)
         return cls(INTERNAL_ERROR, "internal error", {"type": type(exc).__name__})
 
@@ -164,6 +184,45 @@ def make_error(
     if data:
         payload["error"]["data"] = data
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Wire-shape tolerance
+# ---------------------------------------------------------------------------
+_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _to_snake(key: str) -> str:
+    return _CAMEL_BOUNDARY.sub("_", key).lower()
+
+
+def coerce_task_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Accept a task in either wire case and return the model's snake_case.
+
+    A2A's wire format is camelCase — ``sessionId``, ``requesterLane`` — and a
+    real third-party agent emits exactly that. OpenBurrow's own server emits
+    snake_case, because it dumps the model directly. Before this coercion
+    existed, :meth:`PeerClient.send_message` validated the payload with
+    ``model_validate`` on a ``extra="forbid"`` model, so the client parsed only
+    OpenBurrow-shaped tasks: the protocol grounding held for the transport and
+    the card and broke precisely at the first byte a non-OpenBurrow peer sent.
+
+    Accepting both cases is deliberate over rejecting one of them: a tolerant
+    parser is what lets an OpenBurrow lane and a foreign agent talk to each
+    other, and nothing here can widen a task's *semantics* — unknown keys still
+    fail validation downstream.
+    """
+    converted: dict[str, Any] = {}
+    for key, raw_value in payload.items():
+        value: Any = raw_value
+        if isinstance(value, dict):
+            value = coerce_task_payload(value)
+        elif isinstance(value, list):
+            value = [
+                coerce_task_payload(item) if isinstance(item, dict) else item for item in value
+            ]
+        converted[_to_snake(str(key))] = value
+    return converted
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +315,7 @@ __all__ = [
     "UNSUPPORTED_OPERATION",
     "JsonRpcError",
     "JsonRpcRequest",
+    "coerce_task_payload",
     "iterate_sse",
     "make_error",
     "make_request",

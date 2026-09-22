@@ -310,11 +310,15 @@ class TestCustomAdapter:
         """No terminal, so nothing translates anything: a pipe wants LF."""
         lane = make_lane("custom")
         adapter = CustomScriptAdapter(Settings(), lane=lane)
-        adapter.process = _FakeProcess()
+        # A stand-in for asyncio.subprocess.Process; the adapter only reads
+        # `.stdin.buffer`, which the fake provides. Held in a local so the
+        # assertions read the fake rather than the declared `Process | None`.
+        fake = _FakeProcess()
+        adapter.process = fake  # type: ignore[assignment]
 
         await adapter.send_prompt(lane, "hello")
 
-        assert adapter.process.stdin.buffer == b"hello\n"
+        assert fake.stdin.buffer == b"hello\n"
 
     def test_no_command_is_a_config_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("OPENBURROW_CUSTOM_ADAPTER_COMMAND", raising=False)

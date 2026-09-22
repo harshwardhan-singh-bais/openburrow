@@ -58,6 +58,7 @@ from openburrow.adapters.base import (
     _pty_write,
     _strip_ansi,
 )
+from openburrow.core.config.settings import Settings
 from openburrow.core.logging import get_logger
 from openburrow.core.models import Lane, TaskArtifact
 
@@ -257,7 +258,7 @@ class GenericCliAdapter(HarnessAdapter):
     #: True when the harness exposes MCP tools natively.
     mcp_native: bool = False
 
-    def __init__(self, settings, *, lane: Lane | None = None) -> None:
+    def __init__(self, settings: Settings, *, lane: Lane | None = None) -> None:
         super().__init__(settings, lane=lane)
         self._pending_prompt: str | None = None
 

@@ -41,4 +41,7 @@ class TestAfterStartHook:
         """
         adapter = MockAdapter(Settings())
         lane = Lane(name="probe", harness="mock", session_id="sess_probe")
-        assert await adapter._after_start(lane) is None
+        # Awaiting it is the whole assertion. The hook is declared `-> None`,
+        # so there is no value to compare — and the previous bug was that the
+        # expression could not be evaluated at all.
+        await adapter._after_start(lane)

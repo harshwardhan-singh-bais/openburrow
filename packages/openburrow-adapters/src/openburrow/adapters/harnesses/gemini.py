@@ -62,11 +62,8 @@ so the work is a mapping job rather than a research job when it is picked up:
 
 from __future__ import annotations
 
-import os
-
 from openburrow.a2a.card import SkillSpec
 from openburrow.adapters.harnesses.generic import GenericCliAdapter
-from openburrow.core.models import Lane
 
 
 class GeminiAdapter(GenericCliAdapter):

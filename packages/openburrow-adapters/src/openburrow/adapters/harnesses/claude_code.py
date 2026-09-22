@@ -35,7 +35,21 @@ class ClaudeCodeAdapter(GenericCliAdapter):
     docs_url = "https://docs.anthropic.com/en/docs/claude-code"
 
     base_args: tuple[str, ...] = ()
-    structured_args: tuple[str, ...] = ("--output-format", "stream-json")
+    #: ``--verbose`` is not decoration, and it is not optional.
+    #:
+    #: ``--output-format stream-json`` puts the CLI into print mode, and Claude
+    #: Code 2.1.265 refuses that combination without it — measured against the
+    #: real binary, by running this adapter's own argv with a prompt on stdin:
+    #:
+    #:     Error: When using --print, --output-format=stream-json requires --verbose
+    #:
+    #: Without the flag the lane started, printed that one line, and emitted no
+    #: frames at all. The adapter would have seen a silent harness and published
+    #: nothing — the exact failure its :meth:`_from_json` override exists to
+    #: prevent, arriving by a route the override cannot see. This is why the
+    #: adapter is verified against the installed binary and not only against a
+    #: frame fixture: every fixture agreed with the declaration.
+    structured_args: tuple[str, ...] = ("--output-format", "stream-json", "--verbose")
     prompt_as_arg: bool = True
     prompt_flag: str = "-p"
     has_structured_mode: bool = True

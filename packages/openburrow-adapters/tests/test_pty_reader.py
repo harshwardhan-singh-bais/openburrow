@@ -48,7 +48,7 @@ class ClaudePtyProbe(ClaudeCodeAdapter):
     """
 
     binary = sys.executable
-    base_args = ("-u", str(STUB))
+    base_args: tuple[str, ...] = ("-u", str(STUB))
     structured_args = ()
 
 

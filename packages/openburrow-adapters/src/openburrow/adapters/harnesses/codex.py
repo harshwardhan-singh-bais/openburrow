@@ -159,7 +159,10 @@ class CodexAdapter(GenericCliAdapter):
         """
         frame = payload.get(self.ENVELOPE_KEY)
         enveloped = isinstance(frame, dict)
-        inner: dict[str, Any] = frame if enveloped else payload
+        # The isinstance is repeated inside the ternary on purpose: mypy
+        # narrows `frame` for a conditional on `enveloped`, but not
+        # inside a conditional expression.
+        inner: dict[str, Any] = frame if isinstance(frame, dict) else payload
 
         output = super()._from_json(inner)
         frame_type = str(inner.get("type") or inner.get("kind") or "")

@@ -891,7 +891,10 @@ class HarnessAdapter(ABC):
 
         1. A structured injection hook, if the harness exposes one.
         2. A prompt prefix — the message rendered as context, then the task.
-        3. A context file the harness reads on next turn.
+        3. A context file the harness reads on next turn (item 53's fallback:
+           the file lands in the lane's working directory, where every harness
+           reads *something* — AGENTS.md for the convention-aware ones, the
+           repo listing for the rest).
 
         Returns True when the injection took. A False return is a real signal:
         it means the lane is discoverable on the bus but not actually reachable,
@@ -904,6 +907,15 @@ class HarnessAdapter(ABC):
             await self.send_prompt(self.lane, rendered)  # type: ignore[arg-type]
             return True
         except Exception as exc:
+            dropped = self.drop_context_file(message, rendered)
+            if dropped:
+                log.warning(
+                    "adapter.inject_via_context_file",
+                    adapter=self.name,
+                    lane_id=getattr(self.lane, "id", None),
+                    path=str(dropped),
+                )
+                return True
             log.warning(
                 "adapter.inject_failed",
                 adapter=self.name,
@@ -919,6 +931,38 @@ class HarnessAdapter(ABC):
                 context={"adapter": self.name, "message_id": message.id},
                 cause=exc,
             ) from exc
+
+    def drop_context_file(self, message: BusMessage, rendered: str) -> Path | None:
+        """Last-resort delivery: write the message where the harness will read it.
+
+        Item 53's fallback for harnesses with no programmatic hook. The file is
+        written into the lane's worktree under a name every harness either reads
+        by convention (``AGENTS.md``) or cannot miss in a directory listing; the
+        message's provenance stays in the file so a harness that picks it up is
+        never reading unattributed text. Returns the path written, or ``None``
+        when there is nowhere to write — a lane with no worktree has no fallback,
+        and pretending otherwise would lose the message silently.
+        """
+        lane = self.lane
+        cwd: Path | None = None
+        worktree = str(getattr(lane, "worktree_path", "") or "") if lane is not None else ""
+        if worktree:
+            cwd = Path(worktree)
+        if cwd is None or not cwd.exists():
+            return None
+        target = cwd / "AGENTS.md"
+        try:
+            existing = target.read_text(encoding="utf-8") if target.exists() else ""
+            block = (
+                f"\n<!-- openburrow:message:{message.id} -->\n"
+                f"{rendered}\n"
+                "<!-- /openburrow:message -->\n"
+            )
+            target.write_text(existing + block, encoding="utf-8")
+        except OSError as exc:
+            log.warning("adapter.context_file_failed", adapter=self.name, error=str(exc))
+            return None
+        return target
 
     def render_injection(self, message: BusMessage) -> str:
         """Render an A2A message as text a harness will understand.

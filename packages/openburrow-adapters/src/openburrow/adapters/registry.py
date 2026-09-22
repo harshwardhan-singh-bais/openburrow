@@ -10,6 +10,18 @@ Two sources of adapters:
   (``prompt`` | ``allow`` | ``deny``) rather than silently. Loading arbitrary
   code from a repo checkout without asking is how you get a supply-chain
   incident inside an agent orchestration tool.
+
+The three trust modes mean what they say:
+
+``allow``
+    Load every custom adapter without asking. Correct for CI images you control.
+``deny``
+    Never load, never ask.
+``prompt``
+    Ask on the terminal, once per module, and load only what is approved. When
+    there is no terminal to ask — a daemon, a CI job, a pipe — the answer is
+    **no**. A trust gate that defaults to *yes* when nobody is watching is not a
+    gate; it is a delay.
 """
 
 from __future__ import annotations
@@ -17,6 +29,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +47,7 @@ _BUILTIN_MODULES: dict[str, str] = {
     "codex": "openburrow.adapters.harnesses.codex:CodexAdapter",
     "crush": "openburrow.adapters.harnesses.crush:CrushAdapter",
     "gemini": "openburrow.adapters.harnesses.gemini:GeminiAdapter",
+    "vscode": "openburrow.adapters.harnesses.vscode:VSCodeAdapter",
     "aider": "openburrow.adapters.harnesses.aider:AiderAdapter",
     "goose": "openburrow.adapters.harnesses.goose:GooseAdapter",
     "mock": "openburrow.adapters.harnesses.mock:MockAdapter",
@@ -48,17 +62,28 @@ _ALIASES: dict[str, str] = {
     "gemini-cli": "gemini",
     "antigravity": "gemini",
     "codex-cli": "codex",
+    "vscode": "vscode",
+    "vs-code": "vscode",
     "script": "custom",
 }
+
+
+#: Callable that decides whether one custom adapter module may be imported.
+#: Returns ``True`` to load it. The default asks the terminal.
+ConfirmFn = Callable[[Path], bool]
 
 
 class AdapterRegistry:
     """Resolves harness names to adapter classes and instances."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, confirm: ConfirmFn | None = None) -> None:
         self.settings = settings
         self._classes: dict[str, type[HarnessAdapter]] = {}
         self._custom_loaded = False
+        # Injectable so the trust prompt is testable without a pty, and so a
+        # host that already has its own approval UI (the daemon, the TUI) can
+        # supply it instead of having a second, divergent prompt.
+        self._confirm: ConfirmFn = confirm if confirm is not None else _ask_terminal
 
     # --- registration ------------------------------------------------------
     def register(self, name: str, adapter_cls: type[HarnessAdapter]) -> None:
@@ -156,7 +181,8 @@ class AdapterRegistry:
             return
         self._custom_loaded = True
 
-        if self.settings.custom_adapter_trust == "deny":
+        trust = self.settings.custom_adapter_trust
+        if trust == "deny":
             log.debug("adapter.custom_denied_by_policy")
             return
 
@@ -169,20 +195,41 @@ class AdapterRegistry:
         for module_path in sorted(directory.glob("*.py")):
             if module_path.name.startswith("_"):
                 continue
-            if self.settings.custom_adapter_trust == "prompt":
-                log.warning(
-                    "adapter.custom_requires_trust",
-                    path=str(module_path),
-                    hint=(
-                        "Set OPENBURROW_CUSTOM_ADAPTER_TRUST=allow to load custom "
-                        "adapters, or =deny to silence this."
-                    ),
-                )
+            if trust == "prompt" and not self._confirm_custom(module_path):
                 continue
             try:
                 self._load_custom_module(module_path)
             except Exception as exc:
                 log.error("adapter.custom_load_failed", path=str(module_path), error=str(exc))
+
+    def _confirm_custom(self, module_path: Path) -> bool:
+        """Ask the trust gate about one module. Any failure to ask means *no*.
+
+        A prompter that raises, returns a non-boolean, or cannot reach a
+        terminal must not be interpreted as consent — that is the whole point of
+        putting a gate here rather than an unconditional import.
+        """
+        try:
+            approved = bool(self._confirm(module_path))
+        except Exception as exc:
+            log.warning(
+                "adapter.custom_trust_prompt_failed",
+                path=str(module_path),
+                error=str(exc),
+            )
+            return False
+
+        if not approved:
+            log.warning(
+                "adapter.custom_trust_declined",
+                path=str(module_path),
+                hint=(
+                    "Custom adapters are third-party code and were not loaded. "
+                    "Set OPENBURROW_CUSTOM_ADAPTER_TRUST=allow to load them "
+                    "without asking, or =deny to stop asking."
+                ),
+            )
+        return approved
 
     def _load_custom_module(self, module_path: Path) -> None:
         module_name = f"openburrow_custom_adapter_{module_path.stem}"
@@ -214,6 +261,38 @@ class AdapterRegistry:
             )
 
 
+def _ask_terminal(module_path: Path) -> bool:
+    """Ask the operator whether one custom adapter module may be imported.
+
+    The question goes to **stderr**, not stdout: ``burrow adapters list --json``
+    writes machine-readable output there, and a prompt spliced into a JSON
+    document is a bug that only shows up in a pipeline.
+
+    Returns ``False`` when there is no terminal to ask. An unattended process
+    gets the safe answer rather than a guess.
+    """
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        log.debug("adapter.custom_trust_unattended", path=str(module_path))
+        return False
+
+    # ``sys.stderr.write`` rather than ``print``: T20 reserves print for scripts,
+    # and the constraint here is the same one the prompt itself documents — this
+    # must go to stderr so a JSON pipeline on stdout stays machine-readable.
+    sys.stderr.write(
+        f"OpenBurrow found a custom adapter at {module_path}\n"
+        "  Custom adapters are third-party code; loading one imports it into\n"
+        "  this process with your credentials and your filesystem access.\n"
+        "Load it? [y/N] "
+    )
+    sys.stderr.flush()
+    try:
+        answer = input()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        return False
+    return answer.strip().lower() in {"y", "yes"}
+
+
 def _import_target(target: str) -> type[HarnessAdapter]:
     """Import ``module:Class`` or ``module.Class`` and verify it is an adapter."""
     if ":" in target:
@@ -230,10 +309,10 @@ def _import_target(target: str) -> type[HarnessAdapter]:
     return candidate
 
 
-def build_registry(settings: Settings) -> AdapterRegistry:
-    registry = AdapterRegistry(settings)
+def build_registry(settings: Settings, *, confirm: ConfirmFn | None = None) -> AdapterRegistry:
+    registry = AdapterRegistry(settings, confirm=confirm)
     registry._load_builtins()
     return registry
 
 
-__all__ = ["AdapterRegistry", "build_registry"]
+__all__ = ["AdapterRegistry", "ConfirmFn", "build_registry"]

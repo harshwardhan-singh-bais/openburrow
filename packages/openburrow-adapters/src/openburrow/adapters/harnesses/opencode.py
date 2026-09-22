@@ -42,6 +42,7 @@ from openburrow.adapters.harnesses.generic import (
     _as_float,
     _first_int,
 )
+from openburrow.core.config.settings import Settings
 from openburrow.core.errors import AdapterError
 from openburrow.core.logging import get_logger
 from openburrow.core.models import Lane, TaskArtifact
@@ -50,6 +51,18 @@ log = get_logger(__name__)
 
 #: How long to wait for the headless server to accept connections.
 SERVER_BOOT_TIMEOUT_S = 20.0
+
+
+def _info_dict(item: Any) -> dict[str, Any]:
+    """The message's ``info`` object, or an empty one.
+
+    Assigned to a local before the isinstance check so the narrowed type
+    survives: repeating the lookup in the guard and in the value leaves mypy
+    with ``Any | dict | None``, which is how ``info.get(...)`` type-checked
+    while the docstring below promised a null ``info`` could not raise.
+    """
+    info = item.get("info")
+    return info if isinstance(info, dict) else {}
 
 
 class OpenCodeAdapter(HarnessAdapter):
@@ -72,7 +85,7 @@ class OpenCodeAdapter(HarnessAdapter):
     #: Enforcement sits on the finished spec, so it catches this path too.
     credential_env: tuple[str, ...] = ("OPENCODE_API_KEY",)
 
-    def __init__(self, settings, *, lane: Lane | None = None) -> None:
+    def __init__(self, settings: Settings, *, lane: Lane | None = None) -> None:
         super().__init__(settings, lane=lane)
         self.server_url = settings.opencode_server_url.rstrip("/")
         self._client: httpx.AsyncClient | None = None
@@ -280,7 +293,7 @@ class OpenCodeAdapter(HarnessAdapter):
                 for item in response.json() or []:
                     if not isinstance(item, dict):
                         continue
-                    info = item.get("info") if isinstance(item.get("info"), dict) else {}
+                    info = _info_dict(item)
                     message_id = str(item.get("id") or info.get("id") or "")
                     if not message_id or message_id in seen:
                         continue
@@ -307,7 +320,7 @@ class OpenCodeAdapter(HarnessAdapter):
         ``"info": "..."`` would raise ``AttributeError`` from inside the read
         loop and end the lane's output with a traceback in the log.
         """
-        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        info = _info_dict(item)
 
         role = str(item.get("role") or info.get("role") or "")
         if role not in {"assistant", ""}:
@@ -337,7 +350,7 @@ class OpenCodeAdapter(HarnessAdapter):
         if not texts:
             return None
 
-        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        info = _info_dict(item)
         usage = item.get("usage") or info.get("tokens")
         tokens = usage if isinstance(usage, dict) else {}
         cost = _as_float(item.get("cost"))

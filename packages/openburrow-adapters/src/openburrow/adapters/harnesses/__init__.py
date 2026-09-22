@@ -15,6 +15,7 @@ from openburrow.adapters.harnesses.generic import GenericCliAdapter
 from openburrow.adapters.harnesses.goose import GooseAdapter
 from openburrow.adapters.harnesses.mock import MockAdapter
 from openburrow.adapters.harnesses.opencode import OpenCodeAdapter
+from openburrow.adapters.harnesses.vscode import VSCodeAdapter
 
 __all__ = [
     "AiderAdapter",
@@ -27,4 +28,5 @@ __all__ = [
     "GooseAdapter",
     "MockAdapter",
     "OpenCodeAdapter",
+    "VSCodeAdapter",
 ]

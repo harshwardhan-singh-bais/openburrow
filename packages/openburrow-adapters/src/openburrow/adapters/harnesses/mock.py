@@ -28,7 +28,7 @@ from openburrow.a2a.card import HarnessCapabilities, SkillSpec
 from openburrow.adapters.base import HarnessAdapter, HarnessOutput, SpawnSpec
 from openburrow.core.config.settings import Settings
 from openburrow.core.logging import get_logger
-from openburrow.core.models import Lane, TaskArtifact
+from openburrow.core.models import A2ATask, BusMessage, Lane, TaskArtifact
 
 log = get_logger(__name__)
 
@@ -233,7 +233,7 @@ class MockAdapter(HarnessAdapter):
             if output.terminal:
                 continue
 
-    async def inject_message(self, message, task=None) -> bool:
+    async def inject_message(self, message: BusMessage, task: A2ATask | None = None) -> bool:
         rendered = self.render_injection(message)
         self.injected.append(rendered)
         self.prompts.append(rendered)

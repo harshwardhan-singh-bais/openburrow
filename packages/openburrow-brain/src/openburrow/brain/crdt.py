@@ -72,12 +72,18 @@ class _YDoc:
             raise CrdtUnavailableError() from exc
 
         self._Map = Map
-        self.doc = Doc()
+        # Annotated because `Doc` is imported inside the try above, so
+        # mypy has no module-level type to infer from.
+        self.doc: Any = Doc()
         for key in (BRAIN_KEY, PLAN_KEY, CLAIMS_KEY, META_KEY):
-            if key not in self.doc:
+            # `key in self.doc` is true at runtime — pycrdt's Doc serves
+            # membership through __getitem__ — but it declares no __contains__,
+            # so mypy rejects it. keys() is declared and asks the same question.
+            # SIM118 wants the short form back; that is the form mypy refuses.
+            if key not in self.doc.keys():  # noqa: SIM118 - see above
                 self.doc[key] = Map()
 
-    def map(self, key: str):
+    def map(self, key: str) -> Any:
         return self.doc[key]
 
     def set(self, key: str, item_id: str, value: Any) -> bool:

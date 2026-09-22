@@ -109,7 +109,13 @@ class BrainStore:
                 repo_id=self.repo_id, path=path, active_only=active_only
             )
 
-    async def get(self, entry_id: str) -> BrainEntry | None:
+    async def get(self, entry_id: str) -> BrainEntry:
+        """One entry by id. Raises rather than returning ``None``.
+
+        The annotation said ``BrainEntry | None`` while the body raised, so
+        every caller treated a value that cannot be None as optional, and the
+        correct assumption at the call site read as a type error.
+        """
         async with self.database.session() as session:
             entry = await Repository(session).get(BrainEntry, entry_id)
         if entry is None:
@@ -243,6 +249,14 @@ class BrainStore:
         chosen = [entry for _, entry in scored[:budget]]
         for entry in chosen:
             entry.record_injection()
+            # Persisted, not merely mutated. `list_entries` reads rows out of the
+            # database, so a counter bumped on the returned object lived only for
+            # the duration of this call and every injection the Brain ever made was
+            # invisible afterwards — `injection_count` was always 0 on the next
+            # read. Same shape as `lane.heartbeat()`, which mutated an in-memory
+            # lane and persisted nothing, leaving the stale-lane detector to read a
+            # record that no code maintained.
+            await self._save(entry)
         return chosen
 
     # --- internals ---------------------------------------------------------

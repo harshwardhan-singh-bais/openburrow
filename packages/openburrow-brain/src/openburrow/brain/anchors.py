@@ -101,7 +101,7 @@ class AnchorChecker:
     entry would mean hundreds of identical subprocess calls.
     """
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path | str) -> None:
         self.repo_root = Path(repo_root)
         self._head: str | None = None
         self._head_resolved = False

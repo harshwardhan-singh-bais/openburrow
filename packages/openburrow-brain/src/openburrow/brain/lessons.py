@@ -116,7 +116,12 @@ class LessonStore:
             if candidate.source_lane and candidate.source_lane != existing.source_lane:
                 existing.confidence = max(existing.confidence, WIDE_CONFIDENCE_FLOOR)
                 existing.tags = sorted(set(existing.tags) | set(candidate.tags))
-            existing.record_injection(candidate.source_lane or "")
+            # Deliberately no `record_injection` here. A second lane reporting the
+            # same lesson is corroboration, not delivery, and counting it as an
+            # injection made `hit_rate` a ratio of two different things: a lesson
+            # injected once and genuinely helpful, but re-reported by nine lanes,
+            # scored 0.1 and was retired for being useless. The confidence bump
+            # above is the signal a merge actually carries.
             await self._save(existing)
             log.info("lesson.merged", lesson_id=existing.id, title=existing.title)
             return existing
@@ -215,7 +220,14 @@ class LessonStore:
         )
         chosen = eligible[:budget]
         for lesson in chosen:
-            lesson.record_injection(session_id)
+            lesson.record_injection()
+            # Persisted for the same reason as the Brain's, and with a sharper
+            # consequence: `evict_noise` decides entirely from `injection_count`,
+            # so a count that reset to 0 on every read meant no lesson could ever
+            # reach `EVICTION_MIN_SAMPLES` and nothing was ever retired. The
+            # mechanism the design note says exists to stop injected context
+            # growing without bound could not fire at all.
+            await self._save(lesson)
         return chosen
 
     async def evict_noise(self, *, session_id: str) -> EvictionReport:
@@ -231,6 +243,13 @@ class LessonStore:
         for lesson in lessons:
             samples = lesson.injection_count
             if samples < EVICTION_MIN_SAMPLES:
+                continue
+            if not (lesson.helped_lanes or lesson.ignored_by_lanes):
+                # Enough injections, but no outcome has ever been reported.
+                # `hit_rate` reads 0.0 here and that means "nobody said", not
+                # "nobody benefited". Retiring on it would be the system acting on
+                # a number it invented, and the reason string would claim "helped 0
+                # lane(s)" when the truth is that no lane was ever asked.
                 continue
             if lesson.hit_rate >= EVICTION_HIT_RATE:
                 continue

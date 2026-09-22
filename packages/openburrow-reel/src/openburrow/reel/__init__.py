@@ -42,6 +42,14 @@ from openburrow.reel.cast import (
     strip_ansi,
 )
 from openburrow.reel.exporter import ReelExportError, export, render_html
+from openburrow.reel.fork import (
+    DivergenceReport,
+    ForkSpec,
+    compare_with_record,
+    fork_report_text,
+    fork_timeline,
+    run_fork,
+)
 from openburrow.reel.recorder import LaneCoverage, ReelRecorder, ReelRecording
 from openburrow.reel.share import (
     RedactionReport,
@@ -67,6 +75,8 @@ __all__ = [
     "CastEvent",
     "CastHeader",
     "CastWriter",
+    "DivergenceReport",
+    "ForkSpec",
     "LaneCoverage",
     "RedactionReport",
     "ReelExportError",
@@ -78,9 +88,12 @@ __all__ = [
     "between",
     "build_share_url",
     "causal_chain",
+    "compare_with_record",
     "custom_events",
     "effects_of",
     "export",
+    "fork_report_text",
+    "fork_timeline",
     "iter_output",
     "new_secret",
     "preview_redactions",
@@ -89,6 +102,7 @@ __all__ = [
     "redact",
     "redact_payload",
     "render_html",
+    "run_fork",
     "sign",
     "strip_ansi",
     "verify",

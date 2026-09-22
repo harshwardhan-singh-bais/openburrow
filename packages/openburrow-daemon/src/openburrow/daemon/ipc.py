@@ -44,10 +44,11 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
+import inspect
 import json
 import os
 import stat
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -68,6 +69,21 @@ log = get_logger(__name__)
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 Handler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+#: A handler that streams its result back frame by frame, e.g. ``bus.stream``.
+#:
+#: A separate alias because such a handler is **called** differently, not merely
+#: typed differently: an async generator function returns a generator object, and
+#: awaiting that object raises ``TypeError``. Declaring both kinds as ``Handler``
+#: is what let ``bus.stream`` be registered, look fully wired up, and fail on
+#: every call — the dispatcher awaited a generator, and the resulting error was
+#: swallowed by the same broad ``except Exception`` that exists to keep the
+#: socket alive when one handler misbehaves.
+StreamHandler = Callable[[dict[str, Any]], AsyncGenerator[dict[str, Any], None]]
+
+#: What :meth:`IpcServer.register` accepts. The dispatcher branches on the same
+#: distinction, so the type and the behaviour cannot drift apart.
+AnyHandler = Handler | StreamHandler
 
 
 @dataclass(slots=True)
@@ -247,7 +263,9 @@ class _PipeConnection(_Connection):
 
     def write(self, data: bytes) -> None:
         if not self._closed:
-            self._transport.write(data)
+            # The concrete transport handed to us by ``create_connection`` is a
+            # writable one; mypy only sees the declared ``BaseTransport`` supertype.
+            self._transport.write(data)  # type: ignore[attr-defined]
 
     async def drain(self) -> None:
         # Nothing to await: ``Transport.write`` hands the bytes to the proactor,
@@ -331,9 +349,7 @@ def _require_pipe_api() -> Any:
     """
     loop = asyncio.get_running_loop()
     missing = [
-        name
-        for name in ("start_serving_pipe", "create_pipe_connection")
-        if not hasattr(loop, name)
+        name for name in ("start_serving_pipe", "create_pipe_connection") if not hasattr(loop, name)
     ]
     if missing:
         raise BusError(
@@ -353,13 +369,13 @@ class IpcServer:
 
     def __init__(self, paths: BurrowPaths) -> None:
         self.paths = paths
-        self._handlers: dict[str, Handler] = {}
+        self._handlers: dict[str, AnyHandler] = {}
         self._server: asyncio.AbstractServer | None = None
         self._pipe_servers: list[Any] = []
         self._connections: set[_Connection] = set()
         self._tasks: set[asyncio.Task[None]] = set()
 
-    def register(self, method: str, handler: Handler) -> None:
+    def register(self, method: str, handler: AnyHandler) -> None:
         """Register a method. Names are ``namespace.action`` by convention."""
         self._handlers[method] = handler
 
@@ -392,7 +408,10 @@ class IpcServer:
                     cause=exc,
                 ) from exc
         else:
-            self._server = await asyncio.start_unix_server(
+            # POSIX-only API: mypy on Windows resolves the platform-stubbed
+            # asyncio module, which hides it even though this branch never runs
+            # on Windows (the ``if is_windows()`` guard above takes the pipe path).
+            self._server = await asyncio.start_unix_server(  # type: ignore[attr-defined]
                 self._on_client,
                 path=self.endpoint,
                 # Without this the reader's own 64 KiB default limit would fire
@@ -565,7 +584,20 @@ class IpcServer:
             return
 
         try:
-            result = await handler(params)
+            # A streaming handler is called, never awaited: `await` on the
+            # generator it returns raises TypeError, which is how a registered
+            # and apparently wired-up `bus.stream` failed on every request.
+            if inspect.isasyncgenfunction(handler):
+                async for chunk in handler(params):
+                    await self._write(
+                        connection, IpcResponse(id=request_id, result=chunk, more=True)
+                    )
+                await self._write(connection, IpcResponse(id=request_id, result=None, more=False))
+                return
+            # The non-streaming branch: the generator case returned above, so the
+            # narrowed handler is awaitable here — mypy cannot see through the
+            # ``inspect.isasyncgenfunction`` guard, hence the ignore.
+            result = await handler(params)  # type: ignore[misc]
         except OpenBurrowError as exc:
             await self._write(connection, IpcResponse(id=request_id, error=exc.to_dict()))
             return
@@ -578,13 +610,6 @@ class IpcServer:
                     error={"code": "internal_error", "message": str(exc)},
                 ),
             )
-            return
-
-        # A handler may return an async generator to stream results.
-        if hasattr(result, "__aiter__"):
-            async for chunk in result:
-                await self._write(connection, IpcResponse(id=request_id, result=chunk, more=True))
-            await self._write(connection, IpcResponse(id=request_id, result=None, more=False))
             return
 
         await self._write(connection, IpcResponse(id=request_id, result=result))
@@ -703,7 +728,11 @@ class IpcClient:
                     transport.close()
                 raise
 
-        reader, writer = await asyncio.open_unix_connection(path=endpoint, limit=MAX_FRAME_BYTES)
+        # POSIX-only API under a platform-stubbed asyncio; see the server-side
+        # ``start_unix_server`` note above.
+        reader, writer = await asyncio.open_unix_connection(  # type: ignore[attr-defined]
+            path=endpoint, limit=MAX_FRAME_BYTES
+        )
         return _StreamConnection(reader, writer)
 
     def _not_running(self, exc: BaseException) -> DaemonNotRunningError:
@@ -735,7 +764,9 @@ def socket_is_live(path: Path) -> bool:
         return False
     import socket
 
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # ``AF_UNIX`` does not exist on Windows, and this function returns False
+    # there two checks above; mypy still resolves the Windows socket stub.
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)  # type: ignore[attr-defined]
     probe.settimeout(0.5)
     try:
         probe.connect(str(path))
@@ -748,10 +779,12 @@ def socket_is_live(path: Path) -> bool:
 
 __all__ = [
     "MAX_FRAME_BYTES",
+    "AnyHandler",
     "Handler",
     "IpcClient",
     "IpcRequest",
     "IpcResponse",
     "IpcServer",
+    "StreamHandler",
     "socket_is_live",
 ]

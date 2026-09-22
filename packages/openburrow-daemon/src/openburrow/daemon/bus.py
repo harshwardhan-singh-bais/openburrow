@@ -20,6 +20,7 @@ from typing import Any
 
 from openburrow.core.db.repository import BusEventLog
 from openburrow.core.logging import get_logger
+from openburrow.daemon.observability import event_family, record_bus_message, span
 
 log = get_logger(__name__)
 
@@ -172,7 +173,12 @@ class EventBus:
             "payload": payload or {},
             "correlation_id": correlation_id,
         }
-        await self.publish(event)
+        # Counted here rather than in `publish` because this is the one path that
+        # both persists and fans out: a `publish`-only counter would miss every
+        # event written through the log and overstate the bus's health.
+        record_bus_message(event_family(event_type))
+        with span("bus.publish", **{"event.type": event_type, "bus.seq": seq}):
+            await self.publish(event)
         return event
 
     # --- consumption -------------------------------------------------------

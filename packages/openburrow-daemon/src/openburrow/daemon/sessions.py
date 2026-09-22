@@ -24,7 +24,7 @@ from pathlib import Path
 
 from openburrow.a2a.lifecycle import TaskLifecycleManager
 from openburrow.a2a.server import LaneA2AServer
-from openburrow.adapters import AdapterRegistry, HarnessAdapter, SpawnSpec
+from openburrow.adapters import AdapterRegistry, HarnessAdapter, HarnessOutput, SpawnSpec
 from openburrow.core.config.load import ResolvedConfig
 from openburrow.core.db.engine import Database
 from openburrow.core.db.repository import AuditLog, BusEventLog, Repository
@@ -37,6 +37,8 @@ from openburrow.core.errors import (
 )
 from openburrow.core.logging import bind_context, get_logger
 from openburrow.core.models import (
+    A2ATask,
+    BusMessage,
     Lane,
     LaneRole,
     LaneStatus,
@@ -45,8 +47,21 @@ from openburrow.core.models import (
     TrustBoundary,
     now,
 )
+from openburrow.core.paths import repo_id_for
+from openburrow.daemon import sandbox
 from openburrow.daemon.bus import EventBus
-from openburrow.daemon.filewatch import WatcherPool
+from openburrow.daemon.chaos import ChaosEngine
+from openburrow.daemon.context import LaneBriefing, assemble_lane_briefing
+from openburrow.daemon.filewatch import FileChange, WatcherPool
+from openburrow.daemon.observability import (
+    record_lane_output,
+    record_lesson_hit,
+    record_lesson_injection,
+    record_retry,
+    record_usage,
+    span,
+)
+from openburrow.daemon.recovery import RecoveryManager
 from openburrow.governance import DelegationLedger, PolicyGate
 
 log = get_logger(__name__)
@@ -67,6 +82,28 @@ class RunningLane:
     @property
     def lane_id(self) -> str:
         return self.lane.id
+
+
+def _briefing_message(lane: Lane, session: Session, briefing: LaneBriefing) -> BusMessage:
+    """Wrap a briefing as a bus message.
+
+    A message rather than a bespoke delivery call, because ``inject_message`` is
+    the one path that already knows how each harness accepts input — and because
+    it puts the briefing on the bus, where a reel can show what a lane was told.
+
+    The sender is left empty on purpose. This is not from a lane and not from the
+    operator, and the rendered attribution reads "from another agent", which is
+    what the briefing text itself already says about where the knowledge came
+    from. Naming a lane here would be a lie a reader could not detect.
+    """
+    return BusMessage(
+        session_id=lane.session_id,
+        thread_id=session.thread_id,
+        recipients=[lane.id],
+        subject="Project briefing",
+        body=briefing.text,
+        payload={"openburrow:briefing": briefing.as_dict()},
+    )
 
 
 class SessionManager:
@@ -96,6 +133,13 @@ class SessionManager:
         self._lifecycle: TaskLifecycleManager | None = None
         self._ledger: DelegationLedger | None = None
         self._gate: PolicyGate | None = None
+        # Built in start(), alongside the lifecycle manager: recovery needs the
+        # same wiring (db, bus, this manager) and is consulted by the supervisor
+        # from the first heartbeat.
+        self.recovery: RecoveryManager | None = None
+        #: The chaos engine is handed in by the daemon after construction (it
+        #: exists only when chaos_enabled); None means faults are never injected.
+        self._chaos_engine: ChaosEngine | None = None
 
     # --- wiring ------------------------------------------------------------
     @property
@@ -126,6 +170,7 @@ class SessionManager:
                 return BusEventLog(self.database.session_factory())
 
             self._lifecycle = TaskLifecycleManager(repo, log_writer, self.config.settings)
+            self.recovery = RecoveryManager(self.config, self.database, self.bus, self)
             self._ledger = DelegationLedger(
                 repo,
                 audit,
@@ -243,6 +288,14 @@ class SessionManager:
                     "extra_args": list(template.extra_args),
                 }
             )
+            # Optional keys only when set, so a spec never carries empty
+            # defaults that would shadow the adapter's own behaviour.
+            if template.command:
+                specs[-1]["command"] = template.command
+            if template.use_pty:
+                specs[-1]["use_pty"] = True
+            if template.env:
+                specs[-1]["env"] = dict(template.env)
         return specs
 
     async def start_lane(
@@ -261,6 +314,9 @@ class SessionManager:
         can_delegate: bool = True,
         transferable: bool = True,
         extra_args: list[str] | None = None,
+        command: list[str] | str = "",
+        use_pty: bool = False,
+        env: dict[str, str] | None = None,
         worktree: Path | None = None,
     ) -> Lane:
         """Create a worktree, spawn the harness, and expose it as an A2A peer."""
@@ -283,6 +339,16 @@ class SessionManager:
         lane.metadata["claims"] = claims or []
         lane.metadata["extra_args"] = extra_args or []
         lane.metadata["model"] = model
+        # The custom adapter reads its command, PTY preference and env from
+        # these keys; every other adapter ignores them in favour of its own
+        # binary. Carried on the lane rather than resolved here so the adapter
+        # stays the single place that knows what its harness needs.
+        if command:
+            lane.metadata["command"] = command
+        if use_pty:
+            lane.metadata["use_pty"] = True
+        if env:
+            lane.metadata["env"] = dict(env)
 
         # --- worktree -----------------------------------------------------
         worktree_path = worktree or self.config.paths.lane_worktree(lane.id)
@@ -307,9 +373,28 @@ class SessionManager:
         spec = adapter.prepare_spawn_spec(lane)
         await self._gate_spawn(lane, spec, role=role)
 
+        # --- sandbox ------------------------------------------------------
+        # After the gate and before the spawn. After the gate so a denied
+        # command is refused rather than wrapped and then refused — a sandbox
+        # availability check on the path of a command that was never going to
+        # run would turn a policy denial into a confusing "backend missing"
+        # error. Before the spawn so the object that runs is the object that was
+        # gated and then wrapped, in that order, with nothing rebuilt in between.
+        #
+        # ``wrap`` raises when sandboxing was asked for and cannot be provided.
+        # That is the intended behaviour, not a rough edge: an operator who sets
+        # sandbox_enabled=true and gets no sandbox has been told something
+        # false, and will act on it.
+        spec = sandbox.wrap(self.config.settings, spec, repo_root=self.config.paths.repo_root)
+
         with bind_context(session_id=session.id, lane_id=lane.id, harness=harness):
             try:
-                await adapter.start(lane, spec=spec)
+                # The span opens *after* the gate, so a refused spawn produces no
+                # lane span at all. A span that exists for a lane which never
+                # started reads, in a trace viewer, exactly like a lane that
+                # started and did nothing — which is the opposite of the truth.
+                with span("lane.start", **{"lane.name": name, "lane.harness": harness}):
+                    await adapter.start(lane, spec=spec)
             except AdapterError as exc:
                 lane.status = LaneStatus.CRASHED
                 await self._persist_lane(lane)
@@ -338,8 +423,8 @@ class SessionManager:
                     port=self._next_port(),
                     card_path=self.config.settings.a2a_agent_card_path,
                     on_message=lambda message: self._on_inbound(lane, adapter, message),
-                    fetch_task=self._fetch_task,
-                    cancel_task=self._cancel_task,
+                    fetch_task=self.fetch_task,
+                    cancel_task=self.cancel_task,
                 )
                 await server.start()
                 lane.declared_skills = [s.id for s in adapter.skills()]
@@ -351,6 +436,12 @@ class SessionManager:
             self._running[lane.id] = RunningLane(
                 lane=lane, adapter=adapter, server=server, reader_task=reader_task
             )
+
+        # --- briefing -------------------------------------------------------
+        # After the adapter started, because delivery goes through the harness's
+        # own input path; before the lane is persisted, so the ids the briefing
+        # spent are written alongside the lane that spent them.
+        await self._brief_lane(lane, adapter, session)
 
         await self._persist_lane(lane)
         session.attach_lane(lane)
@@ -381,6 +472,108 @@ class SessionManager:
             a2a=lane.a2a_endpoint,
         )
         return lane
+
+    async def _brief_lane(
+        self, lane: Lane, adapter: HarnessAdapter, session: Session
+    ) -> LaneBriefing:
+        """Put the repository's accumulated knowledge in front of a starting lane.
+
+        This is the integration point Stages 18 and 19 never had. The Brain and
+        the lesson store both expose a ranked ``select_for_injection``, both are
+        populated by their promotion paths, and until this method existed no code
+        path called either one — so a lane started with an empty context no matter
+        what the session had already learned. Complete, correct, unreachable: the
+        declared-and-inert shape this project keeps finding in its own work.
+
+        Two things are deliberately *not* done here.
+
+        **The briefing is not a spawn argument.** It goes out through
+        :meth:`~openburrow.adapters.base.HarnessAdapter.inject_message`, the same
+        path an inbound A2A message takes. That path already knows how each
+        harness accepts input — a PTY write for one, a structured hook for another
+        — so a new harness gets briefings for free instead of needing a second
+        implementation. It also puts the briefing on the bus, where a reel can
+        show what a lane was told.
+
+        **Nothing is invented when there is nothing to say.** An empty briefing is
+        published as empty rather than filled with "no knowledge recorded yet".
+        A lane told nothing and a lane told a placeholder are in the same
+        position, and the placeholder would make the reel show an injection that
+        carried no information — a number wrong in a plausible direction, which is
+        the one thing this codebase consistently refuses to produce.
+
+        Delivery failure does not stop the lane. A harness that accepts no input
+        is a real problem, but not one this call should turn into a failed start:
+        the lane is discoverable and the failure is published, so the operator
+        sees a lane that started and was never briefed rather than no lane at all.
+
+        The budgets are not parameters. Each store enforces its own hard cap and
+        documents why it is enforced there rather than left to the caller to
+        remember, so a second cap here would be a second policy that could
+        disagree with the first.
+        """
+        with bind_context(session_id=lane.session_id, lane_id=lane.id):
+            briefing = await assemble_lane_briefing(
+                self.database,
+                repo_id=repo_id_for(self.config.paths.repo_root),
+                session_id=session.id,
+                claims=list(lane.metadata.get("claims") or []),
+            )
+            # Written with the lane, so a later "did this lesson help?" can be
+            # attributed without re-deriving what the lane was shown.
+            lane.metadata["briefing"] = briefing.as_dict()
+
+            payload: dict[str, object] = {**briefing.as_dict(), "delivered": False}
+            if briefing.is_empty:
+                payload["reason"] = "nothing recorded for this repository yet"
+            else:
+                try:
+                    delivered = await adapter.inject_message(
+                        _briefing_message(lane, session, briefing)
+                    )
+                except Exception as exc:
+                    payload["reason"] = f"injection failed: {type(exc).__name__}"
+                else:
+                    payload["delivered"] = delivered
+                    if delivered:
+                        # Item 54's denominator, per lane: briefings (or inbound
+                        # injections) that actually reached this lane. The pump
+                        # pairs it with ``injections_actioned`` for the report.
+                        lane.metadata["injections_delivered"] = (
+                            int(lane.metadata.get("injections_delivered") or 0) + 1
+                        )
+                    if delivered:
+                        # Item 217's denominator, driven from the only place that
+                        # actually injects. It was a metric with no producer
+                        # before this call site existed, which is how a dashboard
+                        # reads zero and looks like a quiet system.
+                        #
+                        # Note the two counts measure different moments, on
+                        # purpose. ``select_for_injection`` bumps each lesson's
+                        # ``injection_count`` when it is *chosen*, because the
+                        # store cannot know whether delivery will succeed and its
+                        # eviction threshold is about being spent. This counter is
+                        # bumped only on *arrival*. The two therefore differ by
+                        # exactly the failed deliveries, which is a number worth
+                        # being able to see rather than one worth hiding behind a
+                        # shared name.
+                        record_lesson_injection(len(briefing.lesson_ids))
+                    else:
+                        payload["reason"] = "the harness accepted no input"
+
+            await self.bus.emit(
+                event_type="lane.briefed",
+                session_id=lane.session_id,
+                thread_id=session.thread_id,
+                lane_id=lane.id,
+                summary=(
+                    f"briefed {lane.name} with {len(briefing.brain_entry_ids)} brain "
+                    f"entr{'y' if len(briefing.brain_entry_ids) == 1 else 'ies'} and "
+                    f"{len(briefing.lesson_ids)} lesson(s)"
+                ),
+                payload=payload,
+            )
+        return briefing
 
     @property
     def policy_gate(self) -> PolicyGate:
@@ -604,14 +797,53 @@ class SessionManager:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_S)
                 for running in list(self._running.values()):
                     await self._check_lane(running)
+                if self.recovery is not None:
+                    await self.recovery.requeue_orphans(older_than_s=self._orphan_threshold_s())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.error("supervisor.error", error=str(exc))
 
+    def _orphan_threshold_s(self) -> int:
+        """Stale-heartbeat window: the widest lane timeout, with a floor.
+
+        Requeueing a lane that is merely slow is the failure mode to avoid — a
+        lane with a 900s idle timeout must not be declared orphaned at 60s — so
+        the threshold is derived from the running lanes rather than hard-coded.
+        """
+        timeouts = [r.lane.idle_timeout_s for r in self._running.values() if r.lane.idle_timeout_s]
+        return max(timeouts, default=60)
+
+    def _chaos(self) -> ChaosEngine | None:
+        """The daemon's chaos engine, when armed. Consulted at injection points."""
+        return self._chaos_engine
+
     async def _check_lane(self, running: RunningLane) -> None:
         lane = running.lane
         lane.heartbeat()
+
+        # The beat has to reach the *record*, not just the object. Orphan
+        # detection reads lanes back from the database, so a heartbeat that only
+        # ever lived in memory was invisible to the one check meant to notice a
+        # lane going quiet — and it concluded "dead". Suppressed and logged
+        # rather than raised, because a database hiccup must not end supervision
+        # for every other lane.
+        with contextlib.suppress(Exception):
+            await self._record_heartbeat(lane)
+
+        # Chaos injection point: a scripted kill is indistinguishable from a
+        # real crash to everything downstream, which is the point (item 249).
+        # The stop is via the adapter's own `stop`, not a private attribute —
+        # poking `_started` from outside the adapter is how the mock and the
+        # real adapters come to disagree about what "crashed" means.
+        chaos = self._chaos_engine
+        if chaos is not None and chaos.should_kill(lane.id):
+            log.warning("chaos.kill_lane", lane_id=lane.id)
+            with contextlib.suppress(Exception):
+                await running.adapter.stop(force=True)
+
+        if self.recovery is not None:
+            await self.recovery.check_lane(running)
 
         if not running.adapter.is_running:
             await self._handle_crash(running)
@@ -631,6 +863,21 @@ class SessionManager:
         lane = running.lane
         policy = self.config.adapters.crash_restart
         lane.status = LaneStatus.CRASHED
+        # Item 215: retry rate is the signal that a harness or provider is
+        # unreliable; it is only meaningful if counted at the single choke point
+        # every retry passes through. Labelled by outcome so "we restart a lot"
+        # and "restarting stopped working" are separable — the second is the one
+        # that needs a human, and an unlabelled counter hides it inside the
+        # first.
+        record_retry("attempted")
+        if self.recovery is not None:
+            # Item 166: a structured crash record goes through the recovery
+            # manager, which also keeps the per-lane ring buffer the CLI reads.
+            await self.recovery.record_crash(
+                running,
+                reason="harness process exited",
+                exit_code=running.adapter.returncode,
+            )
 
         await self.bus.emit(
             event_type="lane.crashed",
@@ -641,8 +888,16 @@ class SessionManager:
 
         if policy == "never" or lane.restarts >= self.config.adapters.max_restarts:
             log.error("lane.dead", lane_id=lane.id, restarts=lane.restarts, policy=policy)
+            record_retry("exhausted")
             lane.status = LaneStatus.STOPPED
             await self._persist_lane(lane)
+            # The restart policy is exhausted: the dead-letter path (item 163)
+            # records the failure and stops trying. A dead-lettered lane waits
+            # for a human — `burrow session resume` — not for another attempt.
+            if self.recovery is not None:
+                await self.recovery.record_task_failure(
+                    lane, error=f"restart policy exhausted ({policy})"
+                )
             return
 
         if policy == "once" and lane.restarts >= 1:
@@ -659,6 +914,9 @@ class SessionManager:
         try:
             await running.adapter.restart(lane)
             lane.status = LaneStatus.IDLE
+            record_retry("succeeded")
+            if self.recovery is not None:
+                self.recovery.record_task_success(lane)
             await self.bus.emit(
                 event_type="lane.restarted",
                 session_id=lane.session_id,
@@ -675,7 +933,38 @@ class SessionManager:
         """Read harness output, buffer it, and publish the interesting parts."""
         try:
             async for output in adapter.read_output():
+                # Chaos injection point: corrupt structured output so the
+                # fallback parser and the dead-letter path get real traffic
+                # (item 251). Applied to the copy that gets classified, not to
+                # the buffered original — the record of what the harness
+                # actually said must stay honest.
+                chaos = self._chaos_engine
+                if chaos is not None and output.text:
+                    corrupted = chaos.malform_output(lane.id, output.text)
+                    if corrupted != output.text:
+                        # Mutated in place: everything downstream — the buffer,
+                        # the classifier, the bus — should see the corrupted
+                        # stream exactly as a real malformed harness would have
+                        # produced it, with no second copy to drift.
+                        output.text = corrupted
                 adapter.buffer_output(output)
+                if output.kind == "tool-call" and output.text.strip():
+                    # Item 190's evidence trail: the detector compares what a
+                    # lane *touched* against what it *said* it would touch, and
+                    # the pump is the only place that sees the touches. Rolling
+                    # window — the last N calls describe current behaviour; the
+                    # full history describes a session that no longer exists.
+                    recent = lane.metadata.setdefault("tool_calls", [])
+                    recent.append(output.text[:500])
+                    del recent[:-50]
+                if output.kind == "plan" and output.text.strip():
+                    # Item 190's *disclosure* half, finally recorded. The
+                    # adversarial-intent check reads ``stated_intent`` from this
+                    # metadata key, and until the pump wrote it the detector
+                    # compared tool calls against an empty string — noisy by
+                    # construction, per its own comment. A lane's plan is what
+                    # it said it would do; first plan wins, later ones refine.
+                    lane.metadata.setdefault("stated_intent", output.text[:500])
                 if output.artifacts:
                     lane.metadata.setdefault("artifacts", [])
                     lane.metadata["artifacts"] = [
@@ -685,10 +974,16 @@ class SessionManager:
 
                 usage = adapter.parse_usage(output.text)
                 if usage and lane is not None:
+                    tokens = int(usage.get("input", usage.get("prompt", 0)) or 0) + int(
+                        usage.get("output", usage.get("completion", 0)) or 0
+                    )
                     lane.record_usage(
                         tokens_in=int(usage.get("input", usage.get("prompt", 0)) or 0),
                         tokens_out=int(usage.get("output", usage.get("completion", 0)) or 0),
                     )
+                    # Item 214: per-session token/cost attribution. Exported via
+                    # Prometheus; the per-lane ledger stays the source of truth.
+                    record_usage(lane.session_id, tokens)
 
                 # The adapter owns the "is this worth broadcasting" decision.
                 # ``translate_output`` is documented as exactly that hook — it
@@ -707,6 +1002,12 @@ class SessionManager:
                 # always the one nothing reads.
                 if adapter.translate_output(output) is None:
                     continue
+                if output.terminal and output.kind in {"result", "status"}:
+                    # Item 162's trigger: the pump marks "this lane just claimed
+                    # success", and the supervisor's silent-failure check reads
+                    # it on the next heartbeat. Kept out of the recovery module
+                    # because only the pump sees harness output arrive.
+                    lane.metadata["just_finished"] = True
                 await self.bus.emit(
                     event_type=f"lane.output.{output.kind}",
                     session_id=lane.session_id,
@@ -715,12 +1016,59 @@ class SessionManager:
                     summary=output.text[:200],
                     payload=output.to_bus_payload(),
                 )
+                # Item 218: harness output volume, by kind. Counted after the
+                # emit succeeds, so the metric reflects what actually shipped.
+                record_lane_output(output.kind)
+                self._maybe_record_lesson_hit(lane, output)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error("lane.output_pump_failed", lane_id=lane.id, error=str(exc))
 
-    async def _on_inbound(self, lane: Lane, adapter: HarnessAdapter, message) -> None:
+    # --- metrics -----------------------------------------------------------
+    @staticmethod
+    def _maybe_record_lesson_hit(lane: Lane, output: HarnessOutput) -> None:
+        """Attribute a lane's later output to the lessons it was briefed with.
+
+        This is the producer item 217's numerator never had: ``record_lesson_hit``
+        existed, and nothing called it, so the hit-rate metric read 0 forever and
+        looked like lessons never helped. The attribution is a *detector* in the
+        ADR 0009 sense — recall-oriented, allowed to be noisy. A hit is a
+        structured output (a plan, a diff, a result — not progress chatter) whose
+        text shares a distinctive token with a lesson the lane was briefed on.
+        Recorded once per lane per lesson, because the same fix appearing in ten
+        later outputs is one lesson working, not ten.
+
+        The alternative — declaring the metric unreachable and deleting it —
+        would be honest about the wiring but would discard the one signal that
+        says whether Stage 10 is worth its cost. This is the middle path: a
+        number that can over-count, never one that fabricates.
+        """
+        briefing = lane.metadata.get("briefing") or {}
+        titles = [str(t) for t in (briefing.get("lesson_titles") or []) if t]
+        if not titles:
+            return
+        text = output.text.casefold()
+        if not text.strip() or output.kind not in {"plan", "diff", "result", "error"}:
+            return
+        counted: list[str] = list(lane.metadata.get("lesson_hits") or [])
+        matched = False
+        for title in titles:
+            if title in counted:
+                continue
+            tokens = {t for t in title.casefold().split() if len(t) >= 6}
+            if tokens and any(token in text for token in tokens):
+                counted.append(title)
+                matched = True
+        if not matched:
+            return
+        lane.metadata["lesson_hits"] = counted
+        lane.metadata["injections_actioned"] = (
+            int(lane.metadata.get("injections_actioned") or 0) + 1
+        )
+        record_lesson_hit()
+
+    async def _on_inbound(self, lane: Lane, adapter: HarnessAdapter, message: BusMessage) -> None:
         """Handle a message arriving at a lane's A2A endpoint."""
         with bind_context(session_id=lane.session_id, lane_id=lane.id):
             lane.messages_received += 1
@@ -757,15 +1105,11 @@ class SessionManager:
                 log.warning("lane.inject_failed", lane_id=lane.id, error=str(exc))
             return
 
-    async def _fetch_task(self, task_id: str):
+    async def fetch_task(self, task_id: str) -> A2ATask | None:
         async with self.database.session() as db_session:
-            from openburrow.core.models import A2ATask
-
             return await Repository(db_session).get(A2ATask, task_id)
 
-    async def _cancel_task(self, task_id: str, reason: str):
-        from openburrow.core.models import A2ATask
-
+    async def cancel_task(self, task_id: str, reason: str) -> A2ATask | None:
         async with self.database.session() as db_session:
             repo = Repository(db_session)
             task = await repo.get(A2ATask, task_id)
@@ -774,7 +1118,7 @@ class SessionManager:
             await self.lifecycle.cancel(task, reason=reason)
             return task
 
-    async def _on_file_change(self, lane: Lane, change) -> None:
+    async def _on_file_change(self, lane: Lane, change: FileChange) -> None:
         """Translate a debounced file-change batch into a bus event."""
         await self.bus.emit(
             event_type="files.changed",
@@ -793,6 +1137,17 @@ class SessionManager:
     async def _persist_lane(self, lane: Lane) -> None:
         async with self.database.session() as db_session:
             await Repository(db_session).save(lane)
+
+    async def _record_heartbeat(self, lane: Lane) -> None:
+        """Persist one lane's heartbeat as a single-column update.
+
+        Not ``_persist_lane``: this runs every supervision tick for every running
+        lane, and rewriting the whole row on that cadence is how a supervision
+        pass clobbers a field another coroutine just wrote. The repository method
+        touches only ``last_heartbeat``.
+        """
+        async with self.database.session() as db_session:
+            await Repository(db_session).record_heartbeat(lane.id, when=lane.last_heartbeat)
 
     # --- status ------------------------------------------------------------
     def status(self) -> dict:

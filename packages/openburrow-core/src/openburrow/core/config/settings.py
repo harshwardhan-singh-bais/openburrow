@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 EnvStr = Annotated[str, Field()]
 
@@ -33,16 +33,60 @@ def _split_csv(value: object) -> list[str]:
     return [str(value)]
 
 
+#: A list setting written as a comma-separated string in the environment.
+#:
+#: ``NoDecode`` is load-bearing, not decoration. pydantic-settings treats any
+#: non-scalar annotation as "complex" and JSON-decodes the raw value before
+#: validation ever runs — so ``OPENBURROW_POLICY_ALLOWED_COMMANDS=git,npm``
+#: raised ``SettingsError`` from ``prepare_field_value`` and the ``mode="before"``
+#: CSV validator below never got a chance to run. Every one of the eleven list
+#: settings in ``.env.example`` was affected; the validator that looks like it
+#: handles them was unreachable.
+CsvList = Annotated[list[str], NoDecode]
+
+
+def native_alias(name: str) -> AliasChoices:
+    """A validation alias accepting a provider-native name *and* our own.
+
+    ``env_prefix`` is ``OPENBURROW_``, so every OpenBurrow setting reads
+    ``OPENBURROW_<FIELD>``. A few settings are not ours to rename: an API key the
+    ``anthropic`` SDK also reads, ``AIDER_BIN`` which Aider's own tooling
+    documents, ``GITHUB_TOKEN`` which every GitHub client in existence looks for.
+    Those have to answer to their upstream name as well, or the user ends up
+    maintaining two copies of one credential.
+
+    Declaring the alias is what makes each exception visible. The alternative —
+    an empty ``env_prefix`` so that bare names resolve — reads *every* bare name,
+    which is how a shell's ``ENV=production`` silently became ``settings.env``
+    while the documented ``OPENBURROW_ENV`` did nothing at all.
+
+    Setting a ``validation_alias`` disables ``env_prefix`` for that field, which
+    is why the prefixed form is named explicitly rather than assumed.
+    """
+    return AliasChoices(name, f"OPENBURROW_{name}")
+
+
 class Settings(BaseSettings):
     """Environment-backed runtime settings.
 
-    ``env_prefix`` is empty on purpose: OpenBurrow reads both its own
-    ``OPENBURROW_*`` namespace *and* the provider-native variables harnesses
-    expect (``ANTHROPIC_API_KEY``, ``GITHUB_TOKEN``, …), and those must keep
-    their upstream names to stay compatible with the tools that read them.
+    Two namespaces, and the split is deliberate. OpenBurrow's own settings read
+    ``OPENBURROW_<FIELD>`` via ``env_prefix``. The handful of provider-native
+    variables — ``ANTHROPIC_API_KEY``, ``GITHUB_TOKEN``, ``AIDER_BIN`` and their
+    kin — keep their upstream names through :func:`native_alias`, because the
+    tools that read them are not ours and renaming a credential is how a harness
+    ends up unable to authenticate while ``.env`` looks correct.
+
+    ``env_prefix`` used to be empty "on purpose", to read both namespaces. It
+    read neither: pydantic-settings with no prefix matches the bare field name,
+    so ``OPENBURROW_ENV`` was ignored, ``OPENBURROW_POLICY_DEFAULT_ACTION`` was
+    ignored, and the provider keys worked only because their bare names happened
+    to be the right ones. All 205 documented ``OPENBURROW_*`` variables in
+    ``.env.example`` were inert, and a bare ``ENV`` or ``LOG_LEVEL`` from an
+    unrelated tool was read in their place.
     """
 
     model_config = SettingsConfigDict(
+        env_prefix="OPENBURROW_",
         env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore",
@@ -101,14 +145,14 @@ class Settings(BaseSettings):
     a2a_dedupe_window_s: int = 30
     a2a_sign_messages: bool = False
     a2a_verify_provenance: bool = False
-    a2a_external_peers: list[str] = Field(default_factory=list)
+    a2a_external_peers: CsvList = Field(default_factory=list)
     a2a_conformance_suite: bool = True
 
     # ---- 5. MCP ------------------------------------------------------------
     mcp_enabled: bool = True
-    mcp_config_paths: list[str] = Field(default_factory=list)
+    mcp_config_paths: CsvList = Field(default_factory=list)
     mcp_allow_passthrough: bool = True
-    mcp_deny_servers: list[str] = Field(default_factory=list)
+    mcp_deny_servers: CsvList = Field(default_factory=list)
     mcp_healthcheck_interval_s: int = 60
     mcp_tool_timeout_s: int = 120
 
@@ -134,23 +178,46 @@ class Settings(BaseSettings):
     llm_local_only: bool = False
 
     # Provider keys — read but never logged. `repr=False` keeps them out of
-    # tracebacks and `burrow doctor` dumps.
-    openai_api_key: str = Field(default="", repr=False)
-    openai_api_base: str = "https://api.openai.com/v1"
-    anthropic_api_key: str = Field(default="", repr=False)
-    anthropic_api_base: str = "https://api.anthropic.com"
-    gemini_api_key: str = Field(default="", repr=False)
-    azure_api_key: str = Field(default="", repr=False)
-    azure_api_base: str = ""
-    azure_deployment_name: str = ""
-    ollama_api_base: str = "http://127.0.0.1:11434"
-    vllm_api_base: str = "http://127.0.0.1:8000/v1"
-    openrouter_api_key: str = Field(default="", repr=False)
-    groq_api_key: str = Field(default="", repr=False)
-    deepseek_api_key: str = Field(default="", repr=False)
+    # tracebacks and `burrow doctor` dumps. Each carries a native alias so the
+    # SDK's own variable name works as well as ours.
+    openai_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("OPENAI_API_KEY")
+    )
+    openai_api_base: str = Field(
+        default="https://api.openai.com/v1", validation_alias=native_alias("OPENAI_API_BASE")
+    )
+    anthropic_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("ANTHROPIC_API_KEY")
+    )
+    anthropic_api_base: str = Field(
+        default="https://api.anthropic.com", validation_alias=native_alias("ANTHROPIC_API_BASE")
+    )
+    gemini_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("GEMINI_API_KEY")
+    )
+    azure_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("AZURE_API_KEY")
+    )
+    azure_api_base: str = Field(default="", validation_alias=native_alias("AZURE_API_BASE"))
+    azure_deployment_name: str = Field(
+        default="", validation_alias=native_alias("AZURE_DEPLOYMENT_NAME")
+    )
+    ollama_api_base: str = Field(
+        default="http://127.0.0.1:11434", validation_alias=native_alias("OLLAMA_API_BASE")
+    )
+    vllm_api_base: str = Field(
+        default="http://127.0.0.1:8000/v1", validation_alias=native_alias("VLLM_API_BASE")
+    )
+    openrouter_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("OPENROUTER_API_KEY")
+    )
+    groq_api_key: str = Field(default="", repr=False, validation_alias=native_alias("GROQ_API_KEY"))
+    deepseek_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("DEEPSEEK_API_KEY")
+    )
 
     # ---- 8. adapters -------------------------------------------------------
-    adapters_enabled: list[str] = Field(
+    adapters_enabled: CsvList = Field(
         default_factory=lambda: ["opencode", "claude-code", "codex", "crush"]
     )
     adapter_default: str = "opencode"
@@ -163,23 +230,37 @@ class Settings(BaseSettings):
     adapter_output_buffer_kb: int = 1024
     adapter_term: str = "xterm-256color"
 
-    opencode_bin: str = "opencode"
-    opencode_server_url: str = "http://127.0.0.1:4096"
-    opencode_api_key: str = Field(default="", repr=False)
+    opencode_bin: str = Field(default="opencode", validation_alias=native_alias("OPENCODE_BIN"))
+    opencode_server_url: str = Field(
+        default="http://127.0.0.1:4096", validation_alias=native_alias("OPENCODE_SERVER_URL")
+    )
+    opencode_api_key: str = Field(
+        default="", repr=False, validation_alias=native_alias("OPENCODE_API_KEY")
+    )
     #: Passed to `opencode serve --config`. `.env.example` documented this and
     #: the adapter read it, but the field itself was never declared — so the
     #: adapter raised AttributeError on every spawn while the env var sat in
     #: `.env` being silently dropped by `extra="ignore"`. A documented setting
     #: that nothing can read is worse than an undocumented one.
-    opencode_config_dir: str = ""
-    claude_code_bin: str = "claude"
-    codex_bin: str = "codex"
-    codex_sandbox: str = "workspace-write"
-    codex_approval_policy: str = "on-request"
-    crush_bin: str = "crush"
-    gemini_cli_bin: str = "gemini"
-    aider_bin: str = "aider"
-    goose_bin: str = "goose"
+    #:
+    #: Declaring the field was only half the fix: with an empty ``env_prefix``
+    #: the variable was still not read, so the AttributeError became a silently
+    #: empty string instead. The native alias is what makes it reachable.
+    opencode_config_dir: str = Field(
+        default="", validation_alias=native_alias("OPENCODE_CONFIG_DIR")
+    )
+    claude_code_bin: str = Field(default="claude", validation_alias=native_alias("CLAUDE_CODE_BIN"))
+    codex_bin: str = Field(default="codex", validation_alias=native_alias("CODEX_BIN"))
+    codex_sandbox: str = Field(
+        default="workspace-write", validation_alias=native_alias("CODEX_SANDBOX")
+    )
+    codex_approval_policy: str = Field(
+        default="on-request", validation_alias=native_alias("CODEX_APPROVAL_POLICY")
+    )
+    crush_bin: str = Field(default="crush", validation_alias=native_alias("CRUSH_BIN"))
+    gemini_cli_bin: str = Field(default="gemini", validation_alias=native_alias("GEMINI_CLI_BIN"))
+    aider_bin: str = Field(default="aider", validation_alias=native_alias("AIDER_BIN"))
+    goose_bin: str = Field(default="goose", validation_alias=native_alias("GOOSE_BIN"))
     custom_adapter_dir: str = ".openburrow/adapters"
     custom_adapter_trust: Literal["prompt", "allow", "deny"] = "prompt"
 
@@ -210,11 +291,15 @@ class Settings(BaseSettings):
     # ---- 11. policy / sandbox ---------------------------------------------
     policy_file: str = ".openburrow/policy.yaml"
     policy_enforce: bool = True
-    policy_default_action: Literal["deny", "allow"] = "deny"
-    policy_allowed_commands: list[str] = Field(default_factory=list)
-    policy_denied_commands: list[str] = Field(default_factory=list)
-    policy_allowed_paths: list[str] = Field(default_factory=list)
-    policy_denied_paths: list[str] = Field(default_factory=list)
+    #: ``None`` means "the repository's ``openburrow.yaml`` decides", not "deny".
+    #: A concrete default here would override the committed policy on every run,
+    #: because the env layer is merged last — so a repo that set ``allow`` in YAML
+    #: would be silently reset to whatever this line said.
+    policy_default_action: Literal["deny", "allow"] | None = None
+    policy_allowed_commands: CsvList = Field(default_factory=list)
+    policy_denied_commands: CsvList = Field(default_factory=list)
+    policy_allowed_paths: CsvList = Field(default_factory=list)
+    policy_denied_paths: CsvList = Field(default_factory=list)
     policy_budget_tokens_per_session: int = 2_000_000
     policy_budget_usd_per_session: float = 5.0
     policy_max_files_changed_per_step: int = 200
@@ -223,7 +308,13 @@ class Settings(BaseSettings):
     sandbox_cpu_limit: float = 2.0
     sandbox_mem_limit_mb: int = 2048
     sandbox_network: Literal["deny", "allowlist", "allow"] = "deny"
-    sandbox_network_allowlist: list[str] = Field(default_factory=list)
+    sandbox_network_allowlist: CsvList = Field(default_factory=list)
+    #: Image for the ``docker`` backend. Empty on purpose, and an empty value
+    #: makes that backend unavailable rather than falling back to a guessed
+    #: image: the harness has to run in *something* that has the harness in it,
+    #: and picking a base image on the operator's behalf would run their code in
+    #: a container they never chose.
+    sandbox_docker_image: str = ""
     secrets_scrub_relay: bool = True
     secrets_scan_before_commit: bool = True
 
@@ -235,6 +326,33 @@ class Settings(BaseSettings):
     approvals_any_teammate: bool = True
     approvals_risk_tier_file: str = ".openburrow/risk-tiers.yaml"
     approvals_ci_auto_deny: bool = True
+
+    # ---- 12b. durable recovery (Stage 12) ----------------------------------
+    #: False is the safe default: a human is asked before a crashed session
+    #: restarts itself. Auto-resume without asking is item 168's opt-in, not the
+    #: default, because a session that resumes into a half-finished negotiation
+    #: is doing work nobody just watched it decide to do.
+    recovery_auto_resume: bool = False
+    #: How often a running lane's state is snapshotted. 0 disables periodic
+    #: checkpointing; checkpoints are still taken on every lane state change.
+    recovery_checkpoint_interval_s: int = 300
+    #: Failures a single lane may retry before it lands in the dead-letter state
+    #: (item 163) and waits for a human instead of consuming more budget.
+    recovery_dead_letter_after: int = 5
+    #: Consecutive harness failures before the circuit breaker (item 164) stops
+    #: invoking that harness at all, and how long before a half-open probe.
+    recovery_circuit_threshold: int = 5
+    recovery_circuit_cooldown_s: int = 300
+    #: Flag a lane that reports success but produced no artifacts — item 162's
+    #: silent-failure detection. Off only because a harness that never reports
+    #: artifacts would flag every healthy run.
+    recovery_silent_failure: bool = True
+    #: Per-lane bus queue depth for the bulkhead (item 165): one flooded lane
+    #: must not be able to stall the others. Overflow drops to the log, which
+    #: the lane replays from by seq — the same recovery path a slow subscriber
+    #: already uses.
+    recovery_bulkhead_queue: int = 256
+    recovery_crash_log_keep: int = 50
 
     # ---- 13. brain / lessons / crdt ---------------------------------------
     brain_enabled: bool = True
@@ -273,18 +391,26 @@ class Settings(BaseSettings):
     otel_enabled: bool = False
     otel_exporter_otlp_endpoint: str = Field(
         default="http://127.0.0.1:4317",
-        validation_alias=AliasChoices("OTEL_EXPORTER_OTLP_ENDPOINT", "otel_exporter_otlp_endpoint"),
+        validation_alias=native_alias("OTEL_EXPORTER_OTLP_ENDPOINT"),
     )
     otel_service_name: str = Field(
-        default="openburrow", validation_alias=AliasChoices("OTEL_SERVICE_NAME")
+        default="openburrow", validation_alias=native_alias("OTEL_SERVICE_NAME")
     )
     metrics_prometheus: bool = False
     metrics_port: int = 9464
+    #: Loopback by default, and that default is a security decision rather than
+    #: a convenience. ``prometheus_client.start_http_server`` binds ``0.0.0.0``
+    #: when given no address, which publishes session ids, lane names, token
+    #: spend and governance-flag counts to every host on the network — from a
+    #: daemon whose entire premise is that it owns one developer's machine. A
+    #: scrape target on another box is a deliberate act: set this to that
+    #: interface and say so.
+    metrics_host: str = "127.0.0.1"
 
     # ---- 17. notifications -------------------------------------------------
     notify_enabled: bool = True
     notify_desktop: bool = True
-    notify_on: list[str] = Field(
+    notify_on: CsvList = Field(
         default_factory=lambda: [
             "approval",
             "negotiation-unresolved",
@@ -292,16 +418,44 @@ class Settings(BaseSettings):
             "governance-flag",
         ]
     )
-    slack_webhook_url: str = Field(default="", repr=False)
-    slack_channel: str = "#openburrow"
-    discord_webhook_url: str = Field(default="", repr=False)
-    teams_webhook_url: str = Field(default="", repr=False)
+    slack_webhook_url: str = Field(
+        default="", repr=False, validation_alias=native_alias("SLACK_WEBHOOK_URL")
+    )
+    slack_channel: str = Field(
+        default="#openburrow", validation_alias=native_alias("SLACK_CHANNEL")
+    )
+    discord_webhook_url: str = Field(
+        default="", repr=False, validation_alias=native_alias("DISCORD_WEBHOOK_URL")
+    )
+    teams_webhook_url: str = Field(
+        default="", repr=False, validation_alias=native_alias("TEAMS_WEBHOOK_URL")
+    )
     hooks_file: str = ".openburrow/hooks.yaml"
     webhook_secret: str = Field(default="", repr=False)
-    github_token: str = Field(default="", repr=False)
-    github_repo: str = ""
+    github_token: str = Field(default="", repr=False, validation_alias=native_alias("GITHUB_TOKEN"))
+    github_repo: str = Field(default="", validation_alias=native_alias("GITHUB_REPO"))
     github_pr_on_complete: bool = False
     github_status_checks: bool = False
+    #: Email digest (item 224). Stdlib SMTP only — no new dependency for a
+    #: channel most teams will never enable; the fields are inert until
+    #: `email_digest_enabled` is set. Alias honours the documented
+    #: `OPENBURROW_EMAIL_DIGEST` env name.
+    email_digest_enabled: bool = Field(default=False, validation_alias=native_alias("EMAIL_DIGEST"))
+    email_digest_recipients: CsvList = Field(default_factory=list)
+    #: Alias set is explicit: `OPENBURROW_EMAIL_FROM` keeps the every-field-
+    #: answers-its-prefixed-name contract, `SMTP_FROM` keeps the documented
+    #: `.env.example` name working.
+    email_from: str = Field(
+        default="openburrow@localhost",
+        validation_alias=AliasChoices("OPENBURROW_EMAIL_FROM", "SMTP_FROM"),
+    )
+    smtp_host: str = "localhost"
+    smtp_port: int = 587
+    smtp_user: str = Field(default="", repr=False)
+    smtp_password: str = Field(default="", repr=False)
+    #: `starttls` is mandatory: an unencrypted digest of governance events is
+    #: worse than a missed one. Set false only for a loopback debug relay.
+    smtp_use_tls: bool = True
 
     # ---- 18. relay ---------------------------------------------------------
     relay_enabled: bool = False
@@ -326,7 +480,7 @@ class Settings(BaseSettings):
     relay_db_url: str = "postgresql+asyncpg://openburrow:openburrow@localhost:5432/openburrow"
     relay_db_pool_size: int = 10
     relay_db_max_overflow: int = 20
-    relay_cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    relay_cors_origins: CsvList = Field(default_factory=lambda: ["http://localhost:3000"])
     relay_tenant_quota_sessions: int = 50
     relay_tenant_quota_lanes: int = 200
     relay_fair_scheduling: bool = True

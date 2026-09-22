@@ -36,13 +36,28 @@ Shape of the file::
       tokens_per_session: 2000000
 
 Every section is optional; an empty file is a valid, if uninteresting, config.
-Unknown keys are rejected when ``OPENBURROW_STRICT_CONFIG=true`` and ignored
-(otherwise) with a warning, so a newer config on an older CLI degrades rather
-than explodes.
+
+``schema_version`` is the compatibility contract, and it is asymmetric on purpose.
+A file that declares a version *newer* than this build is refused rather than
+parsed: the newer version may have changed what an existing key means, and
+guessing is how a governance setting quietly becomes advisory. A file that
+declares an *older* version is upgraded by ``burrow config migrate``.
+
+Unknown keys are the other half of that contract. With
+``OPENBURROW_STRICT_CONFIG=false`` (the default) they are preserved and warned
+about, so a config written for a newer build degrades on an older CLI instead of
+exploding; with ``true`` they are a hard error naming each key. **Preserved, not
+dropped** — a key this build cannot interpret may still be load-bearing for the
+build that wrote it, and a round trip through this version must not delete it.
+That is also why :meth:`RepoConfig.unknown_keys` carries a suggestion: relaxing
+this to a warning trades away the typo protection `extra="forbid"` gave for
+free, so the report has to name the likely intended field instead.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,19 +65,44 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from openburrow.core.errors import ConfigError, ConfigSchemaError
+from openburrow.core.logging import get_logger
 from openburrow.core.paths import find_config_file
 from openburrow.core.version import REPO_CONFIG_SCHEMA_VERSION
+
+log = get_logger(__name__)
 
 HarnessName = str
 LaneRole = Literal["implementer", "reviewer", "observer", "coordinator", "custom"]
 RiskTier = Literal["low", "medium", "high", "critical"]
 
 
+@dataclass(frozen=True, slots=True)
+class UnknownKey:
+    """One key in ``openburrow.yaml`` that this build does not model."""
+
+    path: str
+    #: The closest known field at the same level, when one is close enough to be
+    #: worth naming. This is the mitigation for allowing unknown keys at all: a
+    #: typo such as ``govrnance:`` used to be a hard error and is now merely
+    #: preserved, so the report has to be good enough to catch it.
+    suggestion: str | None = None
+
+
 class _Base(BaseModel):
-    """Shared model config: strict-ish, alias-friendly, immutable after load."""
+    """Shared model config: alias-friendly, immutable after load.
+
+    ``extra="allow"`` rather than ``"forbid"``, because the model has to *see*
+    the keys it does not know about before anything can decide what to do with
+    them. Forbidding here made that decision unconditionally, which is why
+    ``OPENBURROW_STRICT_CONFIG=false`` — documented as "unknown keys are
+    preserved" — could not be honoured: an unknown key was a hard
+    ``ConfigError`` at every setting, and the flag reached this module and
+    stopped. Allowing them means :func:`parse_repo_config` is the single place
+    that decides, and it can reject by name, report, or round-trip them.
+    """
 
     model_config = ConfigDict(
-        extra="forbid",
+        extra="allow",
         populate_by_name=True,
         str_strip_whitespace=True,
         validate_assignment=True,
@@ -130,6 +170,20 @@ class LaneTemplate(_Base):
     extra_args: list[str] = Field(default_factory=list)
     #: Free-form labels for filtering (`burrow session start --lane-tag reviewer`).
     tags: list[str] = Field(default_factory=list)
+    #: For `harness: custom` lanes — the command to run, as an argv list
+    #: (preferred) or a shell string. The custom adapter's error hint has told
+    #: users to set this since it was written; the field actually existing is
+    #: what makes that hint true. Ignored by every other harness, which has its
+    #: own binary.
+    command: list[str] | str = ""
+    #: For `custom` lanes: put the command on a PTY (interactive TUI harnesses)
+    #: or a plain pipe (build scripts, one-shot filters). Default False — most
+    #: custom commands are not terminal programs.
+    use_pty: bool = False
+    #: Extra environment variables for this lane, merged over the base env.
+    #: Non-secret values only: secrets belong in the ambient environment and
+    #: reach the lane through `env_passthrough`, never through this file.
+    env: dict[str, str] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +413,60 @@ class RepoConfig(_Base):
         declared = {lane.harness for lane in self.lanes}
         return [h for h in self.adapters.enabled if h in declared] or list(self.adapters.enabled)
 
+    def unknown_keys(self) -> list[UnknownKey]:
+        """Every key this build does not model, with a suggestion where one fits.
 
-def parse_repo_config(data: dict[str, Any], *, source: str = "<dict>") -> RepoConfig:
+        Recursive, because ``extra="allow"`` applies at every level: a key inside
+        ``policy:`` is as much a compatibility question as one at the top level,
+        and reporting only the root would send someone looking in the wrong
+        place. Sorted by path so the message is stable across runs and two
+        reports can be diffed.
+
+        Read off the *validated* model rather than the raw mapping, so the paths
+        are the ones pydantic actually resolved — aliases and nested list items
+        included, not a second parser's opinion of the same file.
+        """
+        found: list[UnknownKey] = []
+
+        def walk(model: BaseModel, prefix: str) -> None:
+            known = list(type(model).model_fields)
+            for key in model.model_extra or {}:
+                near = get_close_matches(key, known, n=1, cutoff=0.7)
+                found.append(
+                    UnknownKey(
+                        path=f"{prefix}{key}",
+                        suggestion=f"{prefix}{near[0]}" if near else None,
+                    )
+                )
+            for name in known:
+                value = getattr(model, name, None)
+                if isinstance(value, BaseModel):
+                    walk(value, f"{prefix}{name}.")
+                elif isinstance(value, list):
+                    for index, item in enumerate(value):
+                        if isinstance(item, BaseModel):
+                            walk(item, f"{prefix}{name}[{index}].")
+
+        walk(self, "")
+        return sorted(found, key=lambda item: item.path)
+
+
+def parse_repo_config(
+    data: dict[str, Any], *, source: str = "<dict>", strict: bool = False
+) -> RepoConfig:
     """Validate a raw mapping into a :class:`RepoConfig`.
 
     Raises :class:`ConfigError` with the offending field path, because "invalid
     configuration" without a line number is not an error message, it is a puzzle.
+
+    ``strict`` decides what an unknown key means, and it is the only thing that
+    does — see the module docstring. The permissive branch *keeps* the key rather
+    than dropping it, because the two callers want opposite things from the same
+    file: someone running this build wants to get on with their work, and
+    ``burrow config migrate`` wants to write the key back out unchanged.
     """
     try:
-        return RepoConfig.model_validate(data or {})
+        config = RepoConfig.model_validate(data or {})
     except ConfigSchemaError:
         raise
     except ValidationError as exc:
@@ -380,6 +479,36 @@ def parse_repo_config(data: dict[str, Any], *, source: str = "<dict>") -> RepoCo
             context={"source": source},
             cause=exc,
         ) from exc
+
+    unknown = config.unknown_keys()
+    if unknown and strict:
+        listed = "; ".join(
+            f"{item.path} (did you mean {item.suggestion!r}?)" if item.suggestion else item.path
+            for item in unknown
+        )
+        raise ConfigError(
+            f"{source} contains keys this build does not model: {listed}",
+            hint=(
+                "OPENBURROW_STRICT_CONFIG=true rejects unknown keys. Remove them, or "
+                "set it to false to have them preserved with a warning."
+            ),
+            context={"source": source, "unknown_keys": [item.path for item in unknown]},
+        )
+    if unknown:
+        log.warning(
+            "config.unknown_keys",
+            source=source,
+            keys=[item.path for item in unknown],
+            suggestions={
+                item.path: item.suggestion for item in unknown if item.suggestion is not None
+            },
+            detail=(
+                "preserved as written; this build does not interpret them. "
+                "OPENBURROW_STRICT_CONFIG=true turns this into an error."
+            ),
+        )
+
+    return config
 
 
 def load_repo_config(
@@ -432,10 +561,22 @@ def load_repo_config(
             context={"path": str(config_path)},
         )
 
-    if not strict:
-        parsed.setdefault("schema_version", REPO_CONFIG_SCHEMA_VERSION)
+    # `strict` has two meanings and this is the first: a strict file must say
+    # which schema it targets rather than inheriting this build's version by
+    # omission. Without the explicit check the `setdefault` below is decorative,
+    # because `RepoConfig.schema_version` already has a default — which is
+    # precisely what it was. The flag was read from the environment, threaded
+    # through two layers, and then did nothing on this path.
+    if strict and "schema_version" not in parsed:
+        raise ConfigSchemaError(
+            f"{config_path.name} does not declare schema_version, and "
+            f"OPENBURROW_STRICT_CONFIG=true requires it",
+            hint=f"Add `schema_version: {REPO_CONFIG_SCHEMA_VERSION}` to the file.",
+            context={"path": str(config_path)},
+        )
+    parsed.setdefault("schema_version", REPO_CONFIG_SCHEMA_VERSION)
 
-    return parse_repo_config(parsed, source=str(config_path))
+    return parse_repo_config(parsed, source=str(config_path), strict=strict)
 
 
 def dump_repo_config(config: RepoConfig) -> str:
@@ -472,6 +613,7 @@ __all__ = [
     "ProjectConfig",
     "RelayConfig",
     "RepoConfig",
+    "UnknownKey",
     "dump_repo_config",
     "load_repo_config",
     "parse_repo_config",

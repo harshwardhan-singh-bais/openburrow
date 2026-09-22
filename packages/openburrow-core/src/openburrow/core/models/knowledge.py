@@ -231,7 +231,16 @@ class Lesson(BurrowModel):
             return 0.0
         return round(len(self.helped_lanes) / total, 4)
 
-    def record_injection(self, lane_id: str) -> None:
+    def record_injection(self) -> None:
+        """Count one delivery of this lesson to a lane.
+
+        No lane id, because this records *that* the lesson was spent, not on whom.
+        Which lanes benefited is ``helped_lanes``, and that comes from
+        :meth:`record_helped` — i.e. from an outcome someone reported, not from
+        delivery. The parameter that used to be here was ignored by the body and
+        called with a session id at one site and a lane id at another, so the
+        signature promised a fact no caller kept and no reader could trust.
+        """
         self.injection_count += 1
         self.touch()
 

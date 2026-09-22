@@ -123,7 +123,11 @@ class ResolvedConfig:
         # Settings and read by nothing, so OPENBURROW_POLICY_DEFAULT_ACTION had no
         # effect on the gate while looking exactly like the knob that sets it.
         # Every other policy field was merged here; these two were the gap.
-        base.default_action = self.settings.policy_default_action
+        #
+        # Only when set: the env layer is merged last, so an unconditional
+        # assignment would override the committed policy on every run.
+        if self.settings.policy_default_action is not None:
+            base.default_action = self.settings.policy_default_action
         if self.settings.policy_allowed_commands:
             base.allowed_commands = list(self.settings.policy_allowed_commands)
         if self.settings.policy_denied_commands:

@@ -15,12 +15,12 @@ you are unsure where a feature should get its data, the answer is usually here.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, col
 
 from openburrow.core.db.models import (
     ApprovalRow,
@@ -39,6 +39,7 @@ from openburrow.core.db.models import (
     StepRow,
     TaskRow,
 )
+from openburrow.core.db.sqlmodel_compat import rows_changed
 from openburrow.core.errors import BusError
 from openburrow.core.logging import get_logger
 from openburrow.core.models import (
@@ -162,9 +163,7 @@ class Repository:
         columns = set(row_cls.model_fields)
         unmapped = sorted(set(data) - columns)
         if unmapped:
-            log.debug(
-                "repo.unmapped_fields_dropped", model=type(model).__name__, fields=unmapped
-            )
+            log.debug("repo.unmapped_fields_dropped", model=type(model).__name__, fields=unmapped)
             data = {key: value for key, value in data.items() if key in columns}
 
         existing = await self.session.get(row_cls, model.id)
@@ -225,7 +224,7 @@ class Repository:
     # --- sessions ----------------------------------------------------------
     async def latest_session(self) -> Session | None:
         result = await self.session.execute(
-            select(SessionRow).order_by(SessionRow.created_at.desc()).limit(1)  # type: ignore[attr-defined]
+            select(SessionRow).order_by(col(SessionRow.created_at).desc()).limit(1)
         )
         row = result.scalars().first()
         return _from_row(row, Session) if row is not None else None
@@ -233,8 +232,8 @@ class Repository:
     async def open_sessions(self) -> list[Session]:
         result = await self.session.execute(
             select(SessionRow)
-            .where(SessionRow.status.in_(["created", "active", "paused"]))  # type: ignore[attr-defined]
-            .order_by(SessionRow.created_at.desc())  # type: ignore[attr-defined]
+            .where(col(SessionRow.status).in_(["created", "active", "paused"]))
+            .order_by(col(SessionRow.created_at).desc())
         )
         return [_from_row(row, Session) for row in result.scalars().all()]
 
@@ -249,8 +248,8 @@ class Repository:
             return exact
         result = await self.session.execute(
             select(SessionRow)
-            .where(SessionRow.id.startswith(reference))
-            .order_by(SessionRow.created_at.desc())  # type: ignore[attr-defined]
+            .where(col(SessionRow.id).startswith(reference))
+            .order_by(col(SessionRow.created_at).desc())
             .limit(2)
         )
         matches = result.scalars().all()
@@ -263,8 +262,8 @@ class Repository:
             )
         by_name = await self.session.execute(
             select(SessionRow)
-            .where(SessionRow.name == reference)
-            .order_by(SessionRow.created_at.desc())  # type: ignore[attr-defined]
+            .where(col(SessionRow.name) == reference)
+            .order_by(col(SessionRow.created_at).desc())
             .limit(1)
         )
         row = by_name.scalars().first()
@@ -273,7 +272,9 @@ class Repository:
     # --- lanes -------------------------------------------------------------
     async def lanes_for_session(self, session_id: str) -> list[Lane]:
         result = await self.session.execute(
-            select(LaneRow).where(LaneRow.session_id == session_id).order_by(LaneRow.created_at)
+            select(LaneRow)
+            .where(col(LaneRow.session_id) == session_id)
+            .order_by(col(LaneRow.created_at))
         )
         return [_from_row(row, Lane) for row in result.scalars().all()]
 
@@ -288,39 +289,71 @@ class Repository:
         return None
 
     async def stale_lanes(self, *, older_than_seconds: int) -> list[Lane]:
+        """Lanes that have shown no sign of life for ``older_than_seconds``.
+
+        The liveness reference is ``last_heartbeat``, falling back to
+        ``started_at`` and then ``created_at``. The fallback is the whole point:
+        a lane that has just been created has no heartbeat yet, and that is
+        *young*, not dead. The previous version tested
+
+            last_heartbeat IS NULL OR last_heartbeat < cutoff
+
+        which made "has not beaten yet" mean "stale" at **every** threshold — the
+        ``IS NULL`` branch never consulted ``older_than_seconds`` at all. Combined
+        with a heartbeat that was only ever written to memory, that reaped every
+        healthy lane at its first supervision tick: the daemon started a lane,
+        and within seconds killed it as an orphan. The row's heartbeat looked
+        fresh in the end only because ``stop_lane`` persists the in-memory lane,
+        so the killing call wrote the evidence of its own mistake.
+
+        ``COALESCE`` keeps the rule in one comparison, which is what makes it
+        testable at a threshold boundary rather than three branches deep.
+        """
         cutoff = now() - timedelta(seconds=older_than_seconds)
+        liveness = func.coalesce(
+            col(LaneRow.last_heartbeat), col(LaneRow.started_at), col(LaneRow.created_at)
+        )
         result = await self.session.execute(
             select(LaneRow)
-            .where(LaneRow.status.notin_(["stopped", "crashed"]))  # type: ignore[attr-defined]
-            .where(
-                # Both codes are needed. `operator` covers the `|` between two
-                # column comparisons that mypy has already widened to `bool`;
-                # `union-attr` covers `.is_()` on a column mypy types as
-                # `datetime | None`. The comment used to name only `operator`,
-                # so the ignore did not suppress the error it was written for
-                # and mypy said so in a note nobody was reading.
-                (LaneRow.last_heartbeat.is_(None)) | (LaneRow.last_heartbeat < cutoff)  # type: ignore[operator, union-attr]
-            )
+            .where(col(LaneRow.status).notin_(["stopped", "crashed"]))
+            .where(liveness < cutoff)
         )
         return [_from_row(row, Lane) for row in result.scalars().all()]
+
+    async def record_heartbeat(self, lane_id: str, *, when: datetime | None = None) -> bool:
+        """Write one lane's heartbeat. Returns whether a row was updated.
+
+        Deliberately a single-column UPDATE rather than a full ``save``. The
+        heartbeat is written on every supervision tick for every running lane, so
+        it must be cheap, and rewriting the whole row twelve times a minute is how
+        a supervision pass starts clobbering fields another coroutine just set.
+
+        This exists because ``stale_lanes`` reads **from records** and the
+        daemon's heartbeat only ever reached the in-memory lane. A liveness check
+        that reads a record nothing maintains cannot tell a busy lane from a dead
+        one, and it answered "dead".
+        """
+        result = await self.session.execute(
+            update(LaneRow).where(col(LaneRow.id) == lane_id).values(last_heartbeat=when or now())
+        )
+        await self.session.commit()
+        return bool(rows_changed(result))
 
     # --- tasks -------------------------------------------------------------
     async def open_tasks(self, session_id: str) -> list[A2ATask]:
         result = await self.session.execute(
             select(TaskRow)
-            .where(TaskRow.session_id == session_id)
-            .where(
-                TaskRow.state.notin_(["completed", "failed", "canceled", "rejected"])  # type: ignore[attr-defined]
-            )
-            .order_by(TaskRow.submitted_at)
+            .where(col(TaskRow.session_id) == session_id)
+            .where(col(TaskRow.state).notin_(["completed", "failed", "canceled", "rejected"]))
+            .order_by(col(TaskRow.submitted_at))
         )
         return [_from_row(row, A2ATask) for row in result.scalars().all()]
 
     async def blocking_tasks(self, session_id: str) -> list[A2ATask]:
         result = await self.session.execute(
             select(TaskRow)
-            .where(TaskRow.session_id == session_id)
-            .where(TaskRow.state.in_(["input_required", "auth_required"]))  # type: ignore[attr-defined]
+            .where(col(TaskRow.session_id) == session_id)
+            .where(col(TaskRow.state).in_(["input_required", "auth_required"]))
         )
         return [_from_row(row, A2ATask) for row in result.scalars().all()]
 
@@ -341,8 +374,8 @@ class Repository:
     async def active_claims(self, session_id: str) -> list[Claim]:
         result = await self.session.execute(
             select(ClaimRow)
-            .where(ClaimRow.session_id == session_id)
-            .where(ClaimRow.status == "active")
+            .where(col(ClaimRow.session_id) == session_id)
+            .where(col(ClaimRow.status) == "active")
         )
         return [_from_row(row, Claim) for row in result.scalars().all()]
 
@@ -357,9 +390,9 @@ class Repository:
     async def expire_claims(self) -> int:
         result = await self.session.execute(
             select(ClaimRow)
-            .where(ClaimRow.status == "active")
-            .where(ClaimRow.expires_at.is_not(None))
-            .where(ClaimRow.expires_at < now())  # type: ignore[operator]
+            .where(col(ClaimRow.status) == "active")
+            .where(col(ClaimRow.expires_at).is_not(None))
+            .where(col(ClaimRow.expires_at) < now())
         )
         rows = result.scalars().all()
         for row in rows:
@@ -375,8 +408,8 @@ class Repository:
     async def plan_for_session(self, session_id: str) -> Plan | None:
         result = await self.session.execute(
             select(PlanRow)
-            .where(PlanRow.session_id == session_id)
-            .order_by(PlanRow.version.desc())  # type: ignore[attr-defined]
+            .where(col(PlanRow.session_id) == session_id)
+            .order_by(col(PlanRow.version).desc())
             .limit(1)
         )
         row = result.scalars().first()
@@ -388,7 +421,7 @@ class Repository:
 
     async def steps_for_plan(self, plan_id: str) -> list[PlanStep]:
         result = await self.session.execute(
-            select(StepRow).where(StepRow.plan_id == plan_id).order_by(StepRow.order)
+            select(StepRow).where(col(StepRow.plan_id) == plan_id).order_by(col(StepRow.order))
         )
         return [_from_row(row, PlanStep) for row in result.scalars().all()]
 
@@ -420,9 +453,9 @@ class Repository:
     async def expired_approvals(self) -> list[ApprovalRequest]:
         result = await self.session.execute(
             select(ApprovalRow)
-            .where(ApprovalRow.status == "pending")
-            .where(ApprovalRow.expires_at.is_not(None))
-            .where(ApprovalRow.expires_at < now())  # type: ignore[operator]
+            .where(col(ApprovalRow.status) == "pending")
+            .where(col(ApprovalRow.expires_at).is_not(None))
+            .where(col(ApprovalRow.expires_at) < now())
         )
         return [_from_row(row, ApprovalRequest) for row in result.scalars().all()]
 
@@ -434,26 +467,24 @@ class Repository:
         path: str | None = None,
         active_only: bool = True,
     ) -> list[BrainEntry]:
-        statement = select(BrainRow).where(BrainRow.repo_id == repo_id)
+        statement = select(BrainRow).where(col(BrainRow.repo_id) == repo_id)
         if active_only:
-            statement = statement.where(BrainRow.status == "active")
+            statement = statement.where(col(BrainRow.status) == "active")
         if path:
-            statement = statement.where(BrainRow.anchor_path == path)
-        result = await self.session.execute(statement.order_by(BrainRow.created_at.desc()))  # type: ignore[attr-defined]
+            statement = statement.where(col(BrainRow.anchor_path) == path)
+        result = await self.session.execute(statement.order_by(col(BrainRow.created_at).desc()))
         return [_from_row(row, BrainEntry) for row in result.scalars().all()]
 
     async def live_lessons(self, *, session_id: str, repo_id: str = "") -> list[Lesson]:
         result = await self.session.execute(
             select(LessonRow)
-            .where(LessonRow.retired_at.is_(None))
+            .where(col(LessonRow.retired_at).is_(None))
             .where(
-                (LessonRow.session_id == session_id)
-                | (LessonRow.repo_id == repo_id if repo_id else LessonRow.id.is_(None))
+                (col(LessonRow.session_id) == session_id)
+                | (col(LessonRow.repo_id) == repo_id if repo_id else col(LessonRow.id).is_(None))
             )
-            .where(
-                (LessonRow.expires_at.is_(None)) | (LessonRow.expires_at > now())  # type: ignore[operator]
-            )
-            .order_by(LessonRow.created_at.desc())  # type: ignore[attr-defined]
+            .where((col(LessonRow.expires_at).is_(None)) | (col(LessonRow.expires_at) > now()))
+            .order_by(col(LessonRow.created_at).desc())
         )
         return [_from_row(row, Lesson) for row in result.scalars().all()]
 
@@ -461,8 +492,8 @@ class Repository:
     async def latest_checkpoint(self, lane_id: str) -> Checkpoint | None:
         result = await self.session.execute(
             select(CheckpointRow)
-            .where(CheckpointRow.lane_id == lane_id)
-            .order_by(CheckpointRow.sequence.desc())  # type: ignore[attr-defined]
+            .where(col(CheckpointRow.lane_id) == lane_id)
+            .order_by(col(CheckpointRow.sequence).desc())
             .limit(1)
         )
         row = result.scalars().first()
@@ -471,9 +502,9 @@ class Repository:
     async def unconsumed_checkpoints(self, session_id: str) -> list[Checkpoint]:
         result = await self.session.execute(
             select(CheckpointRow)
-            .where(CheckpointRow.session_id == session_id)
-            .where(CheckpointRow.consumed_at.is_(None))
-            .order_by(CheckpointRow.sequence)
+            .where(col(CheckpointRow.session_id) == session_id)
+            .where(col(CheckpointRow.consumed_at).is_(None))
+            .order_by(col(CheckpointRow.sequence))
         )
         return [_from_row(row, Checkpoint) for row in result.scalars().all()]
 
@@ -491,9 +522,9 @@ class Repository:
         removed: dict[str, int] = {}
 
         bus_result = await self.session.execute(
-            delete(BusEventRow).where(BusEventRow.created_at < cutoff)  # type: ignore[arg-type]
+            delete(BusEventRow).where(col(BusEventRow.created_at) < cutoff)
         )
-        removed["bus_events"] = int(bus_result.rowcount or 0)  # type: ignore[attr-defined]
+        removed["bus_events"] = int(rows_changed(bus_result) or 0)
 
         for name, row_cls in (
             ("sessions", SessionRow),
@@ -504,7 +535,7 @@ class Repository:
             result = await self.session.execute(
                 delete(row_cls).where(row_cls.created_at < cutoff)  # type: ignore[arg-type]
             )
-            removed[name] = int(result.rowcount or 0)  # type: ignore[attr-defined]
+            removed[name] = int(rows_changed(result) or 0)
 
         log.info("db.pruned", retention_days=retention_days, removed=removed)
         return removed
@@ -575,10 +606,10 @@ class BusEventLog:
         """
         if content_hash:
             duplicate = await self.session.execute(
-                select(BusEventRow.seq)
-                .where(BusEventRow.content_hash == content_hash)
-                .where(BusEventRow.session_id == session_id)
-                .order_by(BusEventRow.seq.desc())
+                select(col(BusEventRow.seq))
+                .where(col(BusEventRow.content_hash) == content_hash)
+                .where(col(BusEventRow.session_id) == session_id)
+                .order_by(col(BusEventRow.seq).desc())
                 .limit(1)
             )
             if duplicate.scalars().first() is not None:
@@ -589,11 +620,29 @@ class BusEventLog:
                     context={"event_type": event_type, "content_hash": content_hash},
                 )
 
-        event_id = payload.get("id") if payload else None
         from openburrow.core.models.ids import new_id
 
+        # The event's identity is its own, always.
+        #
+        # This used to read `payload["id"]` and use it as the primary key, on the
+        # theory that an event *about* an entity should be identified by that
+        # entity. It is a trap, because the payloads callers pass are entity
+        # dumps: `Session.summary()` and `model_dump(mode="json")` both contain
+        # an `id`. So `session.created` claimed the session's own id, and the
+        # later `session.closed` — which emits the same `session.summary()` —
+        # raised `UNIQUE constraint failed: bus_events.id` and was **never
+        # written at all**. The append-only log silently lost the close event,
+        # which is precisely the event a session close exists to record: the
+        # session row said `completed` while the log had no entry for it, and
+        # every reader of the log — audit, report, replay, the standup — agreed
+        # the session was still open.
+        #
+        # De-duplication already has an owner: the `content_hash` check above,
+        # which is keyed on a field callers set deliberately. A second mechanism
+        # for the same concern, keyed on a field callers do not know is being
+        # read, is how the log acquired a hole.
         row = BusEventRow(
-            id=str(event_id) if event_id else new_id("message"),
+            id=new_id("message"),
             session_id=session_id,
             thread_id=thread_id,
             lane_id=lane_id,
@@ -638,12 +687,12 @@ class BusEventLog:
     ) -> list[dict[str, Any]]:
         statement = (
             select(BusEventRow)
-            .where(BusEventRow.session_id == session_id)
-            .where(BusEventRow.seq > since_seq)  # type: ignore[operator]
-            .order_by(BusEventRow.seq)
+            .where(col(BusEventRow.session_id) == session_id)
+            .where(col(BusEventRow.seq) > since_seq)
+            .order_by(col(BusEventRow.seq))
         )
         if event_types:
-            statement = statement.where(BusEventRow.event_type.in_(list(event_types)))  # type: ignore[attr-defined]
+            statement = statement.where(col(BusEventRow.event_type).in_(list(event_types)))
         if limit:
             statement = statement.limit(limit)
         result = await self.session.execute(statement)
@@ -676,7 +725,7 @@ class BusEventLog:
 
     async def latest_seq(self, *, session_id: str) -> int:
         result = await self.session.execute(
-            select(func.max(BusEventRow.seq)).where(BusEventRow.session_id == session_id)
+            select(func.max(col(BusEventRow.seq))).where(col(BusEventRow.session_id) == session_id)
         )
         return int(result.scalar() or 0)
 
@@ -688,19 +737,19 @@ class BusEventLog:
         statement = (
             select(func.count())
             .select_from(BusEventRow)
-            .where(BusEventRow.session_id == session_id)
+            .where(col(BusEventRow.session_id) == session_id)
         )
         if event_type:
-            statement = statement.where(BusEventRow.event_type == event_type)
+            statement = statement.where(col(BusEventRow.event_type) == event_type)
         result = await self.session.execute(statement)
         return int(result.scalar() or 0)
 
     async def volume_by_type(self, *, session_id: str) -> dict[str, int]:
         """Event counts grouped by type — the bus-health panel (item 218)."""
         result = await self.session.execute(
-            select(BusEventRow.event_type, func.count())
-            .where(BusEventRow.session_id == session_id)
-            .group_by(BusEventRow.event_type)
+            select(col(BusEventRow.event_type), func.count())
+            .where(col(BusEventRow.session_id) == session_id)
+            .group_by(col(BusEventRow.event_type))
         )
         return {str(row[0]): int(row[1]) for row in result.all()}
 
@@ -745,11 +794,15 @@ class AuditLog:
         violations_only: bool = False,
         strict_only: bool = False,
     ) -> list[dict[str, Any]]:
-        statement = select(AuditRow).where(AuditRow.session_id == session_id).order_by(AuditRow.seq)
+        statement = (
+            select(AuditRow)
+            .where(col(AuditRow.session_id) == session_id)
+            .order_by(col(AuditRow.seq))
+        )
         if violations_only:
-            statement = statement.where(AuditRow.severity.in_(["violation", "critical"]))  # type: ignore[attr-defined]
+            statement = statement.where(col(AuditRow.severity).in_(["violation", "critical"]))
         if strict_only:
-            statement = statement.where(AuditRow.strict.is_(True))  # type: ignore[attr-defined]
+            statement = statement.where(col(AuditRow.strict).is_(True))
         result = await self.session.execute(statement)
         return [_audit_to_dict(row) for row in result.scalars().all()]
 

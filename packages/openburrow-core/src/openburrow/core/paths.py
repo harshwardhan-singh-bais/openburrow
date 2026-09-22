@@ -138,6 +138,25 @@ def find_config_file(repo_root: Path) -> Path | None:
     return None
 
 
+def repo_id_for(repo_root: Path | str) -> str:
+    """A stable, filesystem-safe identifier for one repository.
+
+    Hashed rather than spelled out because the value lands in a database column
+    and in share links, and a Windows path contains characters that are awkward in
+    both. Twelve hex characters is 48 bits, which is ample for telling apart the
+    handful of repos one user has checked out — the same reasoning as the named
+    pipe name, applied to a value that is stored rather than compared.
+
+    Lives here rather than beside its first caller because three layers need it
+    now — the request surface, the lane briefing, and anything that later reads a
+    row back by repo — and two of those cannot import the third. A second copy of
+    this hash would be a second definition of what a repo *is*, which is the kind
+    of thing that stays consistent until the day it does not.
+    """
+    digest = hashlib.blake2b(str(repo_root).casefold().encode("utf-8"), digest_size=8)
+    return f"repo_{digest.hexdigest()}"
+
+
 @dataclass(frozen=True, slots=True)
 class BurrowPaths:
     """Every path OpenBurrow derives, resolved once per repo.
@@ -194,9 +213,33 @@ class BurrowPaths:
         characters and a Windows repo path can approach that on its own. The
         digest is truncated to 12 hex characters: 48 bits, which is ample for
         telling apart the handful of repos one user has checked out.
+
+        **Lowercased, not casefolded**, and the reason is cross-language rather
+        than typographic. ``apps/web/src/lib/daemon-bridge.ts`` computes this
+        digest a second time in TypeScript, where the only case operation
+        available is ``String.prototype.toLowerCase()``; JavaScript has no
+        casefold. Measured over every Unicode codepoint, ``casefold`` disagrees
+        with ``toLowerCase`` at **352** of them while ``lower`` disagrees at
+        **55** — and all 55 are codepoints Python's bundled Unicode tables do not
+        yet know (V8 maps them, CPython leaves them as identity), which is a
+        version skew that closes on its own rather than a semantic difference.
+
+        The 352 included ``U+00DF``, so a repo at ``...\\straße-projekt``
+        produced one pipe name here and another in the dashboard: the daemon
+        listened on one and the browser dialled the other, and the dashboard said
+        only "daemon unreachable". ``lower`` also handles case-insensitivity
+        better for that character, since ``"STRAßE".lower() == "straße".lower()``
+        on both sides, whereas ``casefold`` turns both into ``strasse`` here and
+        leaves them as ``straße`` there.
+
+        For pure-ASCII paths — every path this project has actually been run
+        against — ``lower`` and ``casefold`` are identical, so no existing pipe
+        name moved. ``scripts/check_endpoint_parity.py`` asserts this agreement
+        against the real TypeScript; do not change the operation on one side
+        without the other.
         """
         user = os.environ.get("USERNAME") or os.environ.get("USER") or "default"
-        repo = hashlib.sha256(str(self.repo_root).casefold().encode("utf-8")).hexdigest()[:12]
+        repo = hashlib.sha256(str(self.repo_root).lower().encode("utf-8")).hexdigest()[:12]
         return rf"\\.\pipe\openburrow-{user}-{repo}"
 
     @property
@@ -338,5 +381,6 @@ __all__ = [
     "find_repo_root_or_none",
     "global_home",
     "is_windows",
+    "repo_id_for",
     "state_home",
 ]

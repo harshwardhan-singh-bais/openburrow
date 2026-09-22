@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from openburrow.core.config.settings import clear_settings_cache
 from openburrow.core.db.engine import close_all, init_database
 
 
@@ -37,6 +38,25 @@ async def database(db_url: str):
 
 @pytest.fixture(autouse=True)
 def _isolate_state_dir(monkeypatch, tmp_path):
-    """Keep ``OPENBURROW_STATE_DIR`` from leaking the developer's real state in."""
+    """Keep the developer's real state directory out of every test.
+
+    This fixture used to be decorative, and the way it failed is worth keeping
+    written down. It set ``OPENBURROW_STATE_DIR`` and ``OPENBURROW_ENV``, and
+    ``Settings`` read neither: with an empty ``env_prefix`` pydantic-settings
+    matches the *bare* field name, so the variables were dropped by
+    ``extra="ignore"`` and every test that resolved a path got the developer's
+    real ``.openburrow``. It also set ``OPENBURROW_ENV=test``, which is not a
+    member of the field's ``Literal["development", "staging", "production"]`` —
+    proof it was never validated, and a value that would have been rejected the
+    moment the prefix started working.
+
+    ``clear_settings_cache`` is not optional either. ``get_settings`` is
+    ``lru_cache``d, so a settings object built by an earlier test would keep
+    answering after the environment changed, and the isolation would be real only
+    for whichever test ran first.
+    """
     monkeypatch.setenv("OPENBURROW_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setenv("OPENBURROW_ENV", "test")
+    monkeypatch.setenv("OPENBURROW_ENV", "development")
+    clear_settings_cache()
+    yield
+    clear_settings_cache()

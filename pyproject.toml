@@ -17,7 +17,27 @@ classifiers = [
   "Topic :: Software Development :: Version Control :: Git",
   "Topic :: System :: Distributed Computing",
 ]
-dependencies = []
+dependencies = [
+  # The 11 workspace members, as BASE dependencies of the virtual root — not
+  # behind an extra. `uv sync` (plain, exactly as README/AGENTS/CONTRIBUTING and
+  # the Makefile promise) must install everything; uv sync is exact by default,
+  # so when these sat behind the `all` extra instead, a plain `uv sync`
+  # uninstalled all 119 runtime packages and left only the dev group. That is
+  # not a hypothetical: it emptied a real environment and `burrow` vanished
+  # from the venv. Extras are for genuinely optional variants; the platform's
+  # own packages are not optional to the platform.
+  "openburrow-core",
+  "openburrow-a2a",
+  "openburrow-acp",
+  "openburrow-adapters",
+  "openburrow-governance",
+  "openburrow-brain",
+  "openburrow-radar",
+  "openburrow-reel",
+  "openburrow-daemon",
+  "openburrow-cli",
+  "openburrow-relay",
+]
 
 [project.urls]
 Homepage = "https://github.com/openburrow/openburrow"
@@ -27,7 +47,10 @@ Changelog = "https://github.com/openburrow/openburrow/blob/main/CHANGELOG.md"
 Issues = "https://github.com/openburrow/openburrow/issues"
 
 [project.optional-dependencies]
-# Convenience umbrella so `uv sync --extra all` installs the full platform.
+# Historical alias for `uv sync --extra all` / `pip install openburrow[all]`.
+# The members are base dependencies now (see above), so this extra resolves to
+# the same set and is kept only so existing commands and docs that pass
+# `--extra all` keep working.
 all = [
   "openburrow-core",
   "openburrow-a2a",
@@ -60,7 +83,26 @@ compile-bytecode = true
 managed = true
 
 [tool.uv.workspace]
-members = ["packages/*"]
+# Explicit, not "packages/*": pytest byte-compiles packages/conftest.py into
+# packages/__pycache__/, and the glob then matches a directory with no
+# pyproject.toml — every uv command in the repo fails with "Workspace member
+# ... is missing a pyproject.toml" until someone notices and deletes it. This
+# has happened twice. A new package must be added here (and to
+# [tool.uv.sources]), which is the trade: one manual line in exchange for a
+# workspace that cannot be silently broken by a bytecode artifact.
+members = [
+  "packages/openburrow-core",
+  "packages/openburrow-a2a",
+  "packages/openburrow-acp",
+  "packages/openburrow-adapters",
+  "packages/openburrow-governance",
+  "packages/openburrow-brain",
+  "packages/openburrow-radar",
+  "packages/openburrow-reel",
+  "packages/openburrow-daemon",
+  "packages/openburrow-cli",
+  "packages/openburrow-relay",
+]
 
 [tool.uv.sources]
 openburrow-core = { workspace = true }
@@ -89,6 +131,11 @@ dev = [
   "mypy>=1.13",
   "pyright>=1.1.390",
   "types-pexpect>=4.9",
+  # python-jose ships no inline types either, and `relay/security.py` runs every
+  # token through it. Without the stub `jwt.decode` returns `Any`, so the claim
+  # checks that follow — the ones standing between a token and an authenticated
+  # request — are not type-checked at all.
+  "types-python-jose>=3.3",
   # PyYAML ships no inline types, and `config/repo_config.py` parses YAML,
   # so without this stub every `yaml.safe_load` result is untyped. The
   # sibling `types-pexpect` is here for the same reason.
@@ -175,6 +222,11 @@ ignore = [
 # never runs is a claim of review that never happened.
 
 [tool.ruff.lint.per-file-ignores]
+# smoke_test.py inserts its own sys.path entry before importing the packages so
+# it can run from a checkout without an install. The path bootstrap must
+# therefore precede the imports it enables — E402 is the pattern working as
+# designed, not an accident to fix.
+"scripts/smoke_test.py" = ["E402"]
 "**/tests/**" = ["S101", "S105", "S106", "ARG001", "PLR2004", "S104", "PLC0415", "SIM117"]
 "**/cli/**" = ["T201"]   # the CLI is allowed to print
 "**/scripts/**" = ["T201"]
@@ -186,6 +238,11 @@ ignore = [
 # `ApprovalTimeout` are the vocabulary the CLI, the docs and the policy gate
 # all use; `PolicyViolationError` is a longer name for the same thing.
 "**/core/errors.py" = ["N818"]
+# `SandboxUnavailable` is the name the sandbox module, its tests and the error
+# hint all use. `SandboxUnavailableError` is a longer word for the same thing,
+# and the exception is raised in exactly one place, so the suffix would not
+# disambiguate anything.
+"**/daemon/sandbox.py" = ["N818"]
 # `run_daemon` is a process entry point. It reports a startup failure on
 # stderr even when logging has not been configured yet — which is precisely
 # the case where a log call would go nowhere — so a print is the right tool.
@@ -277,7 +334,11 @@ show_error_codes = true
 pretty = true
 
 [[tool.mypy.overrides]]
-module = ["ptyprocess.*", "pexpect.*", "pycrdt.*"]
+# pywinpty ships no stubs, and `adapters/base.py` imports `winpty` behind an
+# ImportError guard — it is the Windows PTY backend, so it is absent entirely on
+# a POSIX host and cannot be a hard dependency. The other three are the same
+# shape: an optional backend imported inside a function that handles its absence.
+module = ["ptyprocess.*", "pexpect.*", "pycrdt.*", "winpty"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

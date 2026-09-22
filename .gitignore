@@ -101,3 +101,15 @@ desktop.ini
 scratch/
 tmp/
 .tmp/
+
+# ---------------------------------------------------------------------------
+# Test/verification output captures — write them somewhere else
+# ---------------------------------------------------------------------------
+pytest_*.txt
+smoke_output.txt
+probe_output.txt
+
+# ---------------------------------------------------------------------------
+# Editor probe scaffolds (temporary TS scratch used during web debugging)
+# ---------------------------------------------------------------------------
+.probe/

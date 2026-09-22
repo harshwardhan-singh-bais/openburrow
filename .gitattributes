@@ -1,0 +1,18 @@
+# Every text file is LF, in the repository *and* in the working tree.
+#
+# `[tool.ruff.format] line-ending = "lf"` makes `ruff format --check` a gate on
+# LF, and `core.autocrlf=true` — the Windows default, and set on the machine this
+# was developed on — makes every checkout CRLF. The two cannot both hold, and the
+# gate loses: measured on a fresh `git worktree add` of HEAD, `workspace.py` had
+# 699 CRLF and 0 LF, and `ruff format --check .` reported every file containing a
+# Python code block. It is not a formatting mistake anyone made; it is a
+# checkout setting nobody could see.
+#
+# `eol=lf` is the fix rather than `text=auto` alone, because `text=auto` with no
+# `eol` means "let `core.autocrlf` decide", which is the setting that is wrong.
+#
+# `text=auto` and not `text`, so git still decides for itself whether a file is
+# text. Nothing tracked today is binary, but the swc binary under
+# `apps/web/node_modules` is gitignored rather than absent, and a blanket `text`
+# would corrupt it the moment it stopped being ignored.
+* text=auto eol=lf

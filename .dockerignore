@@ -1,0 +1,71 @@
+# Docker build context exclusions.
+#
+# This file is not an optimisation. Without it the context for `docker compose
+# -f docker/compose.dev.yml build` is the whole repository including `.venv`
+# (a few hundred MB), `apps/web/node_modules` (thousands of files), the Next.js
+# build output, and whatever local SQLite state the developer has accumulated.
+# The daemon target only ever needs `packages/`, `pyproject.toml`, `uv.lock`,
+# `README.md` and `LICENSE`, and the web target needs `apps/web/` minus its
+# build output.
+#
+# Two exclusions are correctness rather than size, and are marked as such below.
+# Patterns are root-anchored with a leading `/` unless the bare name is meant to
+# match at any depth — a bare `fixtures` would also drop the adapter test
+# fixtures, which is not what was intended even though it happens to be
+# harmless here.
+
+# --- version control -------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# --- local Python environment ---------------------------------------------
+# Correctness: `.venv` is a Windows or macOS virtualenv on the developer's
+# machine. Copying it into a Linux image would put a directory of binaries for
+# the wrong platform on `PATH` ahead of the one the image just built.
+/.venv
+/venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+/htmlcov
+/build
+/dist
+
+# --- Node ------------------------------------------------------------------
+node_modules
+/apps/web/.next
+/apps/web/out
+/apps/web/tsconfig.tsbuildinfo
+/apps/web/npm-install.log
+npm-debug.log*
+
+# --- local runtime state ---------------------------------------------------
+# Correctness: `.openburrow/` holds this developer's SQLite database, worktrees,
+# reel exports and daemon socket. Baking it into an image would ship one
+# person's sessions — including the bus log and any credential-adjacent
+# metadata in it — to everyone who pulls that image.
+/.openburrow
+**/.openburrow
+*.db
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# --- docs and scratch ------------------------------------------------------
+# `mkdocs.yml` and `docs/` are published separately; the image does not serve
+# them. The loose files are local run output that must not reach a layer.
+/docs
+/mkdocs.yml
+/examples
+/pytest_*.txt
+/smoke_output.txt
+/_f.txt
+/_u.md
+/_u.txt
+/_u2.md
+/_u3.md

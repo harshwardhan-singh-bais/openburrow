@@ -19,6 +19,13 @@ import asyncio
 import sys
 from pathlib import Path
 
+# Windows consoles redirected to a file default to cp1252, and the negotiation
+# timeline renders a "→" that cp1252 cannot encode. A smoke test that crashes on
+# how its output is piped is reporting the wrong failure, so reconfigure first.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream.encoding and _stream.encoding.lower().replace("-", "") != "utf8":
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # Allow running from a checkout without an install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages"))
 

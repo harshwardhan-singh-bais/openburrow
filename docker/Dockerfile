@@ -61,16 +61,18 @@ COPY packages/openburrow-relay/pyproject.toml packages/openburrow-relay/
 # The workspace members themselves come in the next step, so this layer is cached
 # across every source change.
 #
-# No `--frozen`: there is no `uv.lock` committed yet. Once there is, this should
-# become `--frozen` and the lock should be copied alongside the manifests —
-# a build that re-resolves on every run is a build that ships different
-# dependency versions than the ones anyone tested.
-RUN uv sync --no-dev --no-install-workspace
+# `--frozen` is the point of copying `uv.lock` at all. Without it uv re-resolves
+# from the manifests, which means the image can ship a different dependency set
+# than the one anyone tested — the exact failure a lockfile exists to prevent,
+# reintroduced by the flag that reads it. The comment here used to say there was
+# no `uv.lock` committed; there is, and it had been copied into the layer above
+# the whole time, so the build was resolving against it and then ignoring it.
+RUN uv sync --frozen --no-dev --no-install-workspace
 
 # Now the sources, and the workspace members on top of the resolved tree.
 COPY packages/ packages/
 COPY README.md LICENSE ./
-RUN uv sync --no-dev --no-editable
+RUN uv sync --frozen --no-dev --no-editable
 
 # ---------------------------------------------------------------------------
 # Stage: relay — the relay service

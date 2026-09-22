@@ -52,6 +52,7 @@ theme:
 
 nav:
   - Home: README.md
+  - Running OpenBurrow: guides/running.md
   - Architecture:
       - Overview: architecture/overview.md
       - Decision records:

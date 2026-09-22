@@ -40,10 +40,23 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TS_TYPES = REPO_ROOT / "apps" / "web" / "src" / "types" / "openburrow.ts"
+
+
+def cannot_run(message: str) -> NoReturn:
+    """Report a harness-level failure and exit 2.
+
+    Distinct from drift on purpose: "the two implementations disagree" and "this
+    check could not run" need different responses from whoever reads the output,
+    and collapsing both into exit 1 makes a missing toolchain look like a code
+    defect. `raise SystemExit("message")` exits 1, which is why this is a helper
+    rather than a bare raise.
+    """
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +66,7 @@ TS_TYPES = REPO_ROOT / "apps" / "web" / "src" / "types" / "openburrow.ts"
 
 def read_typescript() -> str:
     if not TS_TYPES.is_file():
-        raise SystemExit(f"error: {TS_TYPES} not found; run this from the repo root")
+        cannot_run(f"error: {TS_TYPES} not found; run this from the repo root")
     return TS_TYPES.read_text(encoding="utf-8")
 
 
@@ -145,10 +158,10 @@ def load_python_enums() -> dict[str, Any]:
         # remove from CI.
         from openburrow.core.models import enums
     except ImportError as exc:  # pragma: no cover - environment dependent
-        raise SystemExit(
+        cannot_run(
             f"error: could not import openburrow.core.models.enums ({exc}).\n"
             "       Run `uv sync` first — this check compares against the installed package."
-        ) from exc
+        )
     return {
         "TaskState": [member.value for member in enums.TaskState],
         "TERMINAL_TASK_STATES": {member.value for member in enums.TERMINAL_TASK_STATES},

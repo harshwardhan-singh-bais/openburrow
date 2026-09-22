@@ -32,6 +32,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from falsify_matcher import replace_anchor, self_check
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "packages"))
 
@@ -322,10 +324,23 @@ def check_9() -> bool:
     "restore the daemon's private kind set",
 )
 def check_10() -> bool:
+    """Revert the daemon to owning the kind set itself.
+
+    The anchor used to be applied with a bare ``str.replace`` whose result was never
+    inspected, so a stale anchor left ``reverted == source`` and this row read
+    VACUOUS — a verdict meaning "the row does not discriminate" when what actually
+    happened was "the revert never happened". The shared matcher raises instead, and
+    the row is reported WEAK, which is the truth.
+
+    The replacement repeats the anchor's indentation, because the matcher inserts at
+    the start of the matched line.
+    """
     source = SESSIONS.read_text(encoding="utf-8")
-    reverted = source.replace(
+    reverted = replace_anchor(
+        source,
         "if adapter.translate_output(output) is None:",
-        'if output.kind in {"plan", "diff", "result", "error"}:',
+        '                if output.kind in {"plan", "diff", "result", "error"}:',
+        SESSIONS.name,
     )
     return "adapter.translate_output(output)" in reverted
 
@@ -403,6 +418,7 @@ CHECKS = [
 
 def main() -> int:
     assert len(CHECKS) == len(ROWS), "row metadata is out of step with the checks"
+    self_check()
 
     vacuous: list[str] = []
     weak: list[str] = []

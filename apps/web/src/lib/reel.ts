@@ -232,10 +232,11 @@ export function parseManifest(raw: unknown): ReelManifest | null {
 // ANSI
 // ---------------------------------------------------------------------------
 
-/* eslint-disable no-control-regex -- matching control characters is the job */
+// Written with `\u001b` escapes rather than literal escape bytes, which is
+// why this needs no `no-control-regex` suppression: the rule looks for
+// control characters in the pattern source, and there are none here.
 const CSI_PATTERN = /\u001b\[([0-9;?]*)([A-Za-z])/g;
 const OSC_PATTERN = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
-/* eslint-enable no-control-regex */
 
 /** Remove every escape sequence. For summaries, tooltips and search. */
 export function stripAnsi(text: string): string {
@@ -305,14 +306,22 @@ export function sgrSpans(input: string): SgrSpan[] {
   const state: Omit<SgrSpan, "text"> = {};
   let cursor = 0;
 
-  const flush = (end: number) => {
-    if (end <= cursor) return;
-    spans.push({ ...state, text: input.slice(cursor, end) });
-  };
-
   // Strip OSC first: title-setting and hyperlinks have no visual effect on the
   // characters and their payloads can contain anything, including `[`.
+  //
+  // Everything below indexes into `text`, never into `input`, and that is not a
+  // stylistic choice. The scan measures positions in the OSC-stripped string, so
+  // a slice taken from `input` with one of those positions is offset by the length
+  // of every OSC that preceded it. Slicing `input` here rendered
+  // `\x1b]0;evil [31m\x07visible` as the escape junk `\x1b]0;evi` — the text the
+  // reader wanted, replaced by the bytes that were supposed to be invisible, and
+  // a PTY sets a window title on essentially every session.
   const text = input.replace(OSC_PATTERN, "");
+
+  const flush = (end: number) => {
+    if (end <= cursor) return;
+    spans.push({ ...state, text: text.slice(cursor, end) });
+  };
 
   CSI_PATTERN.lastIndex = 0;
   let match: RegExpExecArray | null;

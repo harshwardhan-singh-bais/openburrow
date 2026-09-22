@@ -76,7 +76,7 @@ after the last `seq` it actually saw. A stream that drops a frame is missing tha
 frame forever unless the server kept a buffer for you. Polling with an explicit
 cursor is self-healing.
 
-`burrow watch` keeps the streaming path, because a terminal can afford to hold a
+`burrow observability watch` keeps the streaming path, because a terminal can afford to hold a
 connection.
 
 ---

@@ -58,7 +58,7 @@ export function usePoll<T>(
 ): PollState<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
-  const [loading, setLoading] = useState(enabled);
+  const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [nonce, setNonce] = useState(0);
@@ -66,8 +66,18 @@ export function usePoll<T>(
   // The fetcher is almost always a fresh closure each render. Holding it in a
   // ref keeps the effect from restarting the whole poll loop every time the
   // parent re-renders, which would reset the backoff and the interval.
+  //
+  // Written from an effect rather than during render: a render can be
+  // discarded — by a concurrent update, by StrictMode, by a suspended
+  // sibling — and a ref write during render would survive it, leaving the
+  // loop calling a fetcher from a render that never committed. Waiting
+  // costs nothing, because the poll reads this only inside a `setTimeout`
+  // callback and this effect is declared above the one that schedules the
+  // first tick.
   const fetcherRef = useRef(fetcher);
-  fetcherRef.current = fetcher;
+  useEffect(() => {
+    fetcherRef.current = fetcher;
+  });
 
   const backoffRef = useRef(minBackoffMs);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -89,10 +99,12 @@ export function usePoll<T>(
   }, []);
 
   useEffect(() => {
-    if (!enabled) {
-      setLoading(false);
-      return;
-    }
+    // No `setLoading(false)` here. Whether a disabled poll is loading is
+    // derived at the return statement below, which covers the first render,
+    // a toggle, and a toggle back with no state to keep in sync. Fixing
+    // state up inside an effect is a second render that the render could
+    // have computed.
+    if (!enabled) return;
 
     let cancelled = false;
 
@@ -182,7 +194,9 @@ export function usePoll<T>(
     };
   }, [enabled, intervalMs, minBackoffMs, maxBackoffMs, nonce]);
 
-  return { data, error, loading, refreshing, lastUpdated, refresh };
+  // `enabled &&` rather than a reset inside the effect: a poll that is
+  // switched on has no data yet, so it *is* loading.
+  return { data, error, loading: enabled && loading, refreshing, lastUpdated, refresh };
 }
 
 /**
@@ -249,5 +263,14 @@ export function useBusFeed<T extends { seq: number }>(
 
   const state = usePoll(fetcher, { intervalMs, enabled });
 
-  return { ...state, data: state.data ?? [], cursor: cursorRef.current };
+  const data = state.data ?? [];
+  // Derived from the feed, not read out of `cursorRef` during render. A ref
+  // read in render is invisible to React's memoization, and a render that is
+  // discarded would leave the cursor and the feed on screen describing
+  // different moments. The cursor *is* the highest `seq` the fetcher has
+  // seen, and every one of those events is in the feed — the bounded slice
+  // keeps the newest — so deriving it cannot disagree with what is shown.
+  const cursor = data.reduce((max, event) => (event.seq > max ? event.seq : max), 0);
+
+  return { ...state, data, cursor };
 }

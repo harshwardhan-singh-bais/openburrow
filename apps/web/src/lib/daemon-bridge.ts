@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import type * as NodeFs from "node:fs";
 import { connect, type Socket } from "node:net";
 import { homedir, platform } from "node:os";
 import path from "node:path";
@@ -85,6 +87,30 @@ export class DaemonBridgeError extends Error {
 const isWindows = platform() === "win32";
 
 /**
+ * Expand a leading `~` the way Python's `Path.expanduser()` does.
+ *
+ * `openburrow.core.paths` calls `expanduser()` on `OPENBURROW_REPO_ROOT`,
+ * `OPENBURROW_HOME`, `OPENBURROW_GLOBAL_HOME` and — on POSIX only — the
+ * `OPENBURROW_DAEMON_SOCKET` override. Node has no equivalent, so without this
+ * an `OPENBURROW_HOME=~/obhome` resolved to `<repo>/~/obhome` here and to
+ * `<home>/obhome` in the CLI: the dashboard went looking for the daemon inside a
+ * directory literally named `~`, and reported only that it was unreachable.
+ *
+ * Only a bare `~` and a leading `~/` or `~\` are expanded, which is what
+ * `expanduser` does. The `~user` form is deliberately not attempted: Python
+ * resolves it through `pwd`, which has no Node counterpart, so a `~user` path
+ * resolves differently here. That is recorded rather than left to be found, and
+ * `scripts/check_endpoint_parity.py` pins it.
+ */
+function expandUser(candidate: string): string {
+  if (candidate === "~") return homedir();
+  if (candidate.startsWith("~/") || candidate.startsWith("~\\")) {
+    return path.join(homedir(), candidate.slice(2));
+  }
+  return candidate;
+}
+
+/**
  * Which repo the dashboard is looking at.
  *
  * `OPENBURROW_REPO_ROOT` wins because the web app is very often started from
@@ -94,18 +120,28 @@ const isWindows = platform() === "win32";
  */
 export function resolveRepoRoot(): string {
   const configured = process.env.OPENBURROW_REPO_ROOT?.trim();
-  if (configured) return path.resolve(configured);
+  if (configured) return path.resolve(expandUser(configured));
 
   // Mirrors `find_repo_root`: prefer an initialised repo, fall back to any VCS
   // marker, so an uninitialised checkout still resolves rather than erroring.
+  //
+  // The `turbopackIgnore` annotations below are load-bearing, not noise. This
+  // loop deliberately probes paths *outside* the app directory, walking up
+  // towards the filesystem root, and Turbopack's static analysis cannot tell a
+  // bounded probe from an arbitrary one. Without the annotation it concludes the
+  // whole project may be read at runtime and traces every source file (including
+  // `public/`) into the server bundle — which is both a size problem and a
+  // deployment failure waiting to happen. Opting out is correct here precisely
+  // because the walk is the feature: scoping it to a subfolder would mean not
+  // finding the repo root.
   const markers = ["openburrow.yaml", "openburrow.yml", ".openburrow.yaml", ".git"];
   let current = process.cwd();
   for (;;) {
     for (const marker of markers) {
       if (marker === ".git") {
         // A `.git` file (not directory) is a worktree pointer and still counts.
-        if (existsSyncSafe(path.join(current, marker))) return current;
-      } else if (existsSyncSafe(path.join(current, marker))) {
+        if (existsSyncSafe(path.join(/*turbopackIgnore: true*/ current, marker))) return current;
+      } else if (existsSyncSafe(path.join(/*turbopackIgnore: true*/ current, marker))) {
         return current;
       }
     }
@@ -116,40 +152,117 @@ export function resolveRepoRoot(): string {
 }
 
 /**
+ * The repo component of the Windows pipe name.
+ *
+ * `sha256(repo_root.toLowerCase())[:12]`, matching `BurrowPaths.pipe_name`.
+ * Python hashes `str(Path)`, which on Windows is the backslash-separated,
+ * drive-lettered path that `path.resolve` also produces, so the two agree
+ * without further normalisation.
+ *
+ * The case operation has to match Python's exactly, and Python used to
+ * `casefold` here. It no longer does. Measured over every Unicode codepoint,
+ * `casefold` disagrees with `toLowerCase` at 352 of them — JavaScript has no
+ * casefold at all — while `lower` disagrees at 55, every one of which is a
+ * codepoint CPython's bundled tables do not yet know. `U+00DF` was among the
+ * 352, so a repo under a `straße`-style path hashed to one pipe name in Python
+ * and another here: the daemon listened on one and the dashboard dialled the
+ * other, and the only symptom was "daemon unreachable".
+ *
+ * `lower` is also better at the job this digest exists for. `STRAßE` and
+ * `straße` have to hash the same or one directory gets two daemons; `lower`
+ * gives that on both sides, while `casefold` turns both into `strasse` here and
+ * leaves them as `straße` there.
+ *
+ * For pure ASCII — every path this project has been run against — the two
+ * operations are identical, so no existing pipe name moved.
+ */
+function repoPipeDigest(): string {
+  return createHash("sha256")
+    .update(resolveRepoRoot().toLowerCase(), "utf8")
+    .digest("hex")
+    .slice(0, 12);
+}
+
+/**
  * The socket or pipe the daemon is listening on.
  *
- * Kept byte-for-byte compatible with `BurrowPaths.ipc_endpoint` so that the CLI
- * and the dashboard can never disagree about where the daemon is. On Windows the
- * pipe is namespaced per user; mirroring that is what stops two users on one
- * machine from dialling each other's daemon.
+ * This has to agree with `BurrowPaths.ipc_endpoint` exactly, because a
+ * disagreement is invisible: the dashboard reports "daemon unreachable" while
+ * the CLI talks to the same daemon without complaint, and nothing in either
+ * output names the pipe. There is no error to follow.
+ *
+ * It did not agree. The Windows branch returned `\\.\pipe\openburrow-${user}`,
+ * while the Python side appends a 12-hex-character digest of the repo root. So
+ * on Windows the dashboard dialled a pipe that no daemon had ever created — on
+ * every machine, every time. The digest exists in Python for a real reason (two
+ * repos must be able to run two daemons, and Windows refuses a second server on
+ * a bound pipe name); the dashboard simply never implemented its half.
+ *
+ * The previous comment here claimed byte-for-byte compatibility. That claim is
+ * why nobody looked: it answered the question in advance, and it was false.
+ *
+ * A second divergence lived in the same function and was found the same way —
+ * by running both implementations against the same environment and diffing the
+ * strings. `OPENBURROW_HOME` was passed to `path.resolve` without expanding a
+ * leading `~`, so `~/obhome` became `<repo>/~/obhome` here against
+ * `<home>/obhome` in Python. Same symptom, same silence. See `expandUser`.
  */
 export function resolveDaemonEndpoint(): string {
   const override = process.env.OPENBURROW_DAEMON_SOCKET?.trim();
-  if (override) return override;
+  if (override) {
+    // Mirrors an asymmetry in `BurrowPaths` rather than smoothing it over: on
+    // POSIX `socket_path` runs the override through `expanduser()`, while on
+    // Windows `ipc_endpoint` returns it verbatim. Expanding on both sides would
+    // read better and would be wrong — a Windows operator who set
+    // `OPENBURROW_DAEMON_SOCKET=~/x` would get a dashboard that expanded the `~`
+    // and a CLI that did not, which is the original bug reintroduced.
+    // `path.normalize` on the POSIX side, because Python returns
+    // `str(Path(override))` there and `Path` normalises separators: an override
+    // of `C:/sockets/burrow.sock` comes back as `C:\sockets\burrow.sock`, so
+    // returning it raw left the two components naming one socket by two
+    // different strings. The Windows branch stays verbatim, matching
+    // `ipc_endpoint`, which returns the override untouched.
+    return isWindows ? override : path.normalize(expandUser(override));
+  }
 
   if (isWindows) {
     const user = process.env.USERNAME || process.env.USER || "default";
-    return `\\\\.\\pipe\\openburrow-${user}`;
+    return `\\\\.\\pipe\\openburrow-${user}-${repoPipeDigest()}`;
   }
 
-  const runtime = process.env.OPENBURROW_HOME?.trim()
-    ? path.resolve(resolveRepoRoot(), process.env.OPENBURROW_HOME.trim())
-    : path.join(resolveRepoRoot(), ".openburrow");
-  return path.join(runtime, "burrow.sock");
+  return path.join(resolveRuntimeDir(), "burrow.sock");
 }
 
 export function resolveGlobalDir(): string {
   const override = process.env.OPENBURROW_GLOBAL_HOME?.trim();
-  if (override) return path.resolve(override);
+  if (override) return path.resolve(expandUser(override));
   return path.join(homedir(), ".openburrow");
 }
 
 /** The reel directory, for serving exports the daemon wrote. */
 export function resolveReelsDir(): string {
-  const runtime = process.env.OPENBURROW_HOME?.trim()
-    ? path.resolve(resolveRepoRoot(), process.env.OPENBURROW_HOME.trim())
-    : path.join(resolveRepoRoot(), ".openburrow");
-  return path.join(runtime, "reels");
+  return path.join(resolveRuntimeDir(), "reels");
+}
+
+/**
+ * The repo's runtime directory — `<repo>/.openburrow/` unless `OPENBURROW_HOME`
+ * overrides it.
+ *
+ * One copy, deliberately. This derivation was previously written out twice, once
+ * inline in `resolveDaemonEndpoint` and once here, which is the same shape as
+ * the bug that broke the pipe name: two copies of one derivation with nothing
+ * comparing them. Had they drifted, the dashboard would have served replays out
+ * of a directory the daemon never wrote to, and the symptom would have been an
+ * empty list rather than an error.
+ *
+ * Mirrors `BurrowPaths.for_repo`, where a relative override is taken *relative
+ * to the repo root* rather than to the process's working directory — which
+ * matters because the web app is routinely started from somewhere else.
+ */
+function resolveRuntimeDir(): string {
+  const override = process.env.OPENBURROW_HOME?.trim();
+  if (override) return path.resolve(resolveRepoRoot(), expandUser(override));
+  return path.join(resolveRepoRoot(), ".openburrow");
 }
 
 function existsSyncSafe(candidate: string): boolean {
@@ -157,7 +270,7 @@ function existsSyncSafe(candidate: string): boolean {
     // Lazy so this module can be imported in an edge-runtime build without
     // pulling `node:fs` into the module graph eagerly.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require("node:fs") as typeof import("node:fs");
+    const fs = require("node:fs") as typeof NodeFs;
     return fs.existsSync(candidate);
   } catch {
     return false;
@@ -251,12 +364,6 @@ function statusForDaemonCode(code: string): number {
     default:
       return 502;
   }
-}
-
-interface Pending {
-  resolve: (value: IpcEnvelope) => void;
-  reject: (reason: unknown) => void;
-  timer: NodeJS.Timeout;
 }
 
 async function sendEnvelope(

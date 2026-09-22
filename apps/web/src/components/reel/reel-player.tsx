@@ -12,8 +12,6 @@ import {
   causalChain,
   coverageGaps,
   effectsOf,
-  groupByLane,
-  indexTimeline,
   reelDuration,
   textAt,
   typeCounts,
@@ -67,8 +65,6 @@ const SPEEDS = [0.5, 1, 2, 4, 8] as const;
 export function ReelPlayer({ bundle, staticViewerUrl }: ReelPlayerProps) {
   const duration = useMemo(() => reelDuration(bundle), [bundle]);
   const tracks = useMemo(() => bundle.lanes.map((lane) => buildLaneTrack(lane)), [bundle.lanes]);
-  const timelineIndex = useMemo(() => indexTimeline(bundle.timeline), [bundle.timeline]);
-  const byLane = useMemo(() => groupByLane(bundle.timeline), [bundle.timeline]);
   const counts = useMemo(() => typeCounts(bundle.timeline), [bundle.timeline]);
   const gaps = useMemo(() => coverageGaps(bundle), [bundle]);
 

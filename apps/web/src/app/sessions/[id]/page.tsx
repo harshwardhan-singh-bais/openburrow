@@ -12,6 +12,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
 import { bus, sessions, tasks } from "@/lib/api";
 import { SESSION_TONES, TASK_TONES, formatDuration, formatRelative, shortId } from "@/lib/format";
+import { useNow } from "@/lib/use-now";
 import { useBusFeed, usePoll } from "@/lib/use-poll";
 
 /**
@@ -35,6 +36,10 @@ const FEED_LIMIT = Number(process.env.NEXT_PUBLIC_OPENBURROW_FEED_LIMIT ?? 500);
 export default function SessionPage() {
   const params = useParams<{ id: string }>();
   const sessionId = typeof params?.id === "string" ? params.id : "";
+
+  // A clock read is not a render-time value, so it comes from the store that
+  // owns one. See `useNow` for why `0` means "not yet known".
+  const now = useNow();
 
   const sessionState = usePoll(
     (signal) => sessions.show(sessionId, signal),
@@ -241,8 +246,10 @@ export default function SessionPage() {
         </p>
       ) : null}
 
+      {/* `now` is 0 until the first client tick, and a negative duration
+          renders as an em dash rather than as a wrong number. */}
       <p className="text-xs text-muted-foreground">
-        Session age: {formatDuration((Date.now() - Date.parse(session.created_at)) / 1000)}
+        Session age: {formatDuration((now - Date.parse(session.created_at)) / 1000)}
       </p>
     </div>
   );

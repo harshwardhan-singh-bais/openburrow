@@ -148,16 +148,33 @@ export function formatAbsolute(iso: string | null | undefined): string {
   });
 }
 
-/** `00:01:23.4` — the reel scrubber and the cast timeline both want this. */
+/**
+ * `00:01:23.4` — the reel scrubber and the cast timeline both want this.
+ *
+ * Rounds to the nearest tenth, and the rounding is load-bearing rather than
+ * cosmetic. Truncating cannot be done exactly here: `59.9` is stored as
+ * `59.8999999999999985789…`, so `Math.floor((seconds % 1) * 10)` renders it as
+ * `00:00:59.8` — a number wrong in a plausible direction, which is the failure
+ * `AGENTS.md` rule 6 names. Every value the old expression got wrong was wrong by
+ * exactly one tenth, and the ones it happened to get right (`83.4`, `3599.9`) are
+ * why the bug survived: it looked intermittent.
+ *
+ * Rounding the total to tenths *first* is what makes it exact, and it also keeps
+ * the two halves consistent — deriving the seconds and the tenth separately is how
+ * `59.96` becomes `00:00:59.0`, a timecode that has gone backwards. The cost is
+ * that `59.96` now reads `00:01:00.0` rather than `00:00:59.9`; for a display that
+ * shows one decimal, the nearest tenth is the honest answer to give.
+ */
 export function formatTimecode(seconds: number, withTenths = true): string {
   if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const whole = Math.floor(seconds % 60);
+  const tenths = Math.round(seconds * 10);
+  const hours = Math.floor(tenths / 36000);
+  const minutes = Math.floor((tenths % 36000) / 600);
+  const whole = Math.floor((tenths % 600) / 10);
   const pad = (value: number) => String(value).padStart(2, "0");
   const base = `${pad(hours)}:${pad(minutes)}:${pad(whole)}`;
   if (!withTenths) return base;
-  return `${base}.${Math.floor((seconds % 1) * 10)}`;
+  return `${base}.${tenths % 10}`;
 }
 
 /**

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { Input, Label } from "@/components/ui/input";
 import { DetailRow, EmptyState, ErrorState, LoadingState } from "@/components/ui/states";
 import { ApiError, relay } from "@/lib/api";
 import { formatDuration, shortId } from "@/lib/format";
+import { useLocalStorage } from "@/lib/local-storage";
 import { usePoll } from "@/lib/use-poll";
 import type { RelayRoom } from "@/types/openburrow";
 
@@ -37,63 +38,70 @@ const TOKEN_KEY = "openburrow.relay.token";
 const SUBJECT_KEY = "openburrow.relay.subject";
 
 export default function RelayPage() {
-  const [token, setToken] = useState<string | null>(null);
-  const [subject, setSubject] = useState("");
+  // The credential is an external store, read through the hook that hands the
+  // server a null snapshot. See `useLocalStorage`: reading it in the component
+  // body is a hydration mismatch, and reading it in a mount effect is a
+  // synchronous second render.
+  const [token, setToken] = useLocalStorage(TOKEN_KEY);
+  const [storedSubject, setStoredSubject] = useLocalStorage(SUBJECT_KEY);
+
+  // The identity field is a form control that *starts* at the stored value.
+  // Holding what was typed separately from what is stored is what lets the
+  // default be derived in render; `null` means "not typed over yet".
+  const [subjectDraft, setSubjectDraft] = useState<string | null>(null);
+  const subject = subjectDraft ?? storedSubject ?? "";
+
   const [invite, setInvite] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [redeeming, setRedeeming] = useState(false);
   const [redeemError, setRedeemError] = useState<ApiError | null>(null);
-  const [rooms, setRooms] = useState<RelayRoom[] | null>(null);
-  const [roomsError, setRoomsError] = useState<ApiError | null>(null);
-
-  // Read the stored credential after mount, never during render: `localStorage`
-  // does not exist on the server and reading it in a component body is a
-  // hydration mismatch.
-  useEffect(() => {
-    setToken(window.localStorage.getItem(TOKEN_KEY));
-    setSubject(window.localStorage.getItem(SUBJECT_KEY) ?? "");
-  }, []);
 
   const readyz = usePoll((signal) => relay.readyz(signal), { intervalMs: 5000 });
 
-  const loadRooms = useCallback(
-    async (signal: AbortSignal) => {
-      if (!token) return;
-      try {
-        const result = await relay.rooms(signal);
-        setRooms(result.rooms);
-        setRoomsError(null);
-      } catch (error) {
-        setRoomsError(
-          error instanceof ApiError
-            ? error
-            : new ApiError({ code: "openburrow.web.relay_failed", message: "could not list rooms" }, 0),
-        );
-      }
+  // Rooms are polled, not fetched once by an effect. The relay's room list
+  // changes when somebody else creates a room, so a one-shot fetch produces a
+  // list that is stale the moment it is displayed — and `usePoll` already owns
+  // the three things a hand-written fetch forgets: it stops while the tab is
+  // hidden, it backs off while the relay is unreachable, and it never overlaps
+  // requests. It also stops retrying a 401, which is what a stale token
+  // produces.
+  //
+  // `activeToken` is a plain string so the fetcher is typed as one. An empty
+  // token never reaches the wire: `enabled` is false, and `usePoll` does not
+  // call a disabled fetcher.
+  const activeToken = token ?? "";
+  const roomsState = usePoll(
+    async (signal): Promise<{ token: string; items: RelayRoom[] }> => {
+      const result = await relay.rooms(activeToken, signal);
+      return { token: activeToken, items: result.rooms };
     },
-    [token],
+    { intervalMs: 15_000, enabled: activeToken !== "" },
   );
 
-  useEffect(() => {
-    if (!token) {
-      setRooms(null);
-      return;
-    }
-    const controller = new AbortController();
-    void loadRooms(controller.signal);
-    return () => controller.abort();
-  }, [token, loadRooms]);
+  // Tagged with the token that fetched it. A list from a previous credential
+  // must never be shown as if it belonged to the current one, and tagging
+  // makes that impossible without any clearing — clearing is what would
+  // otherwise have to happen in an effect, and it is the kind of state two
+  // writers can disagree about.
+  const fetchedRooms = roomsState.data;
+  const visibleRooms =
+    fetchedRooms !== null && fetchedRooms.token === activeToken ? fetchedRooms.items : null;
 
   const redeem = async () => {
     setRedeeming(true);
     setRedeemError(null);
     try {
       const result = await relay.redeem(invite.trim(), subject.trim(), displayName.trim());
-      window.localStorage.setItem(TOKEN_KEY, result.token);
-      window.localStorage.setItem(SUBJECT_KEY, result.member.subject);
+      // The relay echoes the subject back normalised, so both the field and the
+      // stored default are set from the response rather than from what was typed.
       setToken(result.token);
-      setSubject(result.member.subject);
+      setStoredSubject(result.member.subject);
+      setSubjectDraft(result.member.subject);
       setInvite("");
+      // A new credential makes the old room list the wrong list, and the poll
+      // would not run again until its next tick — up to fifteen seconds of an
+      // empty panel after a successful redeem.
+      roomsState.refresh();
     } catch (error) {
       setRedeemError(
         error instanceof ApiError
@@ -105,11 +113,9 @@ export default function RelayPage() {
     }
   };
 
-  const signOut = () => {
-    window.localStorage.removeItem(TOKEN_KEY);
-    setToken(null);
-    setRooms(null);
-  };
+  // Dropping the token is the whole action: the room list is keyed by token
+  // and hides itself, and the poll is disabled while there is no token.
+  const signOut = () => setToken(null);
 
   const relayMissing =
     readyz.error?.code === "openburrow.web.relay_not_configured" ||
@@ -143,15 +149,15 @@ export default function RelayPage() {
           </CardHeader>
           <CardContent className="space-y-2 pt-0">
             <p className="text-xs text-muted-foreground">
-              This deployment has no <code className="font-mono">OPENBURROW_RELAY_URL</code>, so the
+              This deployment has no <code className="font-mono">OPENBURROW_WEB_RELAY_URL</code>, so the
               relay surfaces are disabled. That is the normal state for a single-machine setup — the
               relay exists to carry the bus between machines, and a bus that never leaves one does
               not need it.
             </p>
             <p className="text-xs text-muted-foreground">
-              To enable it, run <code className="font-mono">burrow relay serve</code> somewhere both
-              machines can reach, then set <code className="font-mono">OPENBURROW_RELAY_URL</code> to
-              its origin and restart the web app.
+              To enable it, run <code className="font-mono">openburrow-relay</code> somewhere both
+              machines can reach, then set <code className="font-mono">OPENBURROW_WEB_RELAY_URL</code>
+              to its origin and restart the web app.
             </p>
           </CardContent>
         </Card>
@@ -222,18 +228,18 @@ export default function RelayPage() {
               </span>
             </div>
 
-            {roomsError ? (
-              <ErrorState error={roomsError} onRetry={() => void loadRooms(new AbortController().signal)} />
-            ) : rooms === null ? (
+            {roomsState.error ? (
+              <ErrorState error={roomsState.error} onRetry={roomsState.refresh} />
+            ) : visibleRooms === null ? (
               <LoadingState label="Loading rooms…" />
-            ) : rooms.length === 0 ? (
+            ) : visibleRooms.length === 0 ? (
               <EmptyState
                 title="No rooms"
                 description="You are a member of no rooms yet. A room is created when a repo is first relayed — ask someone already in it for an invite."
               />
             ) : (
               <div className="overflow-hidden rounded-lg border border-border bg-card">
-                {rooms.map((room) => (
+                {visibleRooms.map((room) => (
                   <div
                     key={room.id}
                     className="flex items-center gap-3 border-b border-border px-3 py-2.5 last:border-b-0"
@@ -286,7 +292,7 @@ export default function RelayPage() {
                   <Input
                     id="subject"
                     value={subject}
-                    onChange={(event) => setSubject(event.target.value)}
+                    onChange={(event) => setSubjectDraft(event.target.value)}
                     placeholder="you@example.com"
                     autoComplete="username"
                   />

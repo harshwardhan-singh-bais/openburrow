@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
  * there is nothing to bridge — only something to *route around*. This catch-all
  * exists for three reasons, and none of them is "hide the relay":
  *
- * 1. **The relay's origin stays server-side.** `OPENBURROW_RELAY_URL` is not a
+ * 1. **The relay's origin stays server-side.** `OPENBURROW_WEB_RELAY_URL` is not a
  *    `NEXT_PUBLIC_` variable, so the browser never learns where the relay is.
  *    That matters because the relay is routinely on a private network and the
  *    web app is routinely not.
@@ -33,9 +33,12 @@ export const dynamic = "force-dynamic";
  *   from the caller's point of view even though the relay dedupes by
  *   `(origin_repo, origin_seq)` — the dedupe is a safety net, not a licence to
  *   retry.
- * - It does not touch WebSocket upgrades. `/stream` and `/doc` are dialled
- *   directly by the browser using `NEXT_PUBLIC_OPENBURROW_RELAY_WS`, because a
- *   Next route handler cannot proxy a long-lived bidirectional socket.
+ * - It does not touch WebSocket upgrades, because a Next route handler cannot
+ *   proxy a long-lived bidirectional socket. `RelayDocProvider` in
+ *   `src/lib/yjs.ts` dials `/rooms/{room}/doc` itself and takes its `ws://` base
+ *   as a constructor option. Nothing constructs it yet, so there is no
+ *   `NEXT_PUBLIC_*` variable for that base and none is declared — an earlier
+ *   version of this comment named one, and no code read it.
  */
 
 /** Only the methods the relay actually serves. A proxy that forwards anything is an open relay. */
@@ -74,8 +77,8 @@ async function forward(
       {
         code: "openburrow.web.relay_not_configured",
         message: "no relay is configured for this deployment",
-        hint: "Set OPENBURROW_RELAY_URL to the relay's origin to enable the relay surfaces. It is deliberately server-side only.",
-        context: { variable: "OPENBURROW_RELAY_URL" },
+        hint: "Set OPENBURROW_WEB_RELAY_URL to the relay's origin to enable the relay surfaces. It is deliberately server-side only.",
+        context: { variable: "OPENBURROW_WEB_RELAY_URL" },
       },
       503,
     );
@@ -138,7 +141,7 @@ async function forward(
       {
         code: "openburrow.web.relay_unreachable",
         message: timedOut ? "the relay did not answer within 30s" : "could not reach the relay",
-        hint: "Check that the relay is running and that OPENBURROW_RELAY_URL points at its origin.",
+        hint: "Check that the relay is running and that OPENBURROW_WEB_RELAY_URL points at its origin.",
         context: { target, detail: cause instanceof Error ? cause.message : String(cause) },
       },
       503,

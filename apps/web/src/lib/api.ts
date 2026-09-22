@@ -79,6 +79,13 @@ export interface RequestOptions {
   method?: "GET" | "POST" | "DELETE";
   body?: unknown;
   signal?: AbortSignal;
+  /**
+   * Sent as `Authorization: Bearer …`. Only the relay uses it: the daemon's
+   * control plane is protected by filesystem permissions on its socket, not by
+   * a header, and an empty string is treated as no token at all rather than
+   * as a malformed one.
+   */
+  token?: string;
   /** Milliseconds. The daemon polls fast; a stalled request should not wedge the UI. */
   timeoutMs?: number;
 }
@@ -94,7 +101,7 @@ const DEFAULT_TIMEOUT_MS = 15_000;
  * in a polling dashboard is a slow leak of pending timers.
  */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", body, signal, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
+  const { method = "GET", body, signal, token, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
   const url = `${apiBase()}${path}`;
 
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -107,6 +114,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       signal: combined,
       headers: {
         Accept: "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -299,8 +307,12 @@ export const relay = {
       body: { invite, subject, display_name: displayName },
     }),
 
-  rooms: (signal?: AbortSignal) =>
-    request<{ rooms: RelayRoom[] }>("/api/relay/rooms", { signal }),
+  // The room token goes in the `Authorization` header: the relay authenticates
+  // with `Bearer <room token>` and answers 401 without it. It used to be stored
+  // in `localStorage` and dropped here, which made the room list permanently
+  // empty — the credential existed everywhere except on the wire.
+  rooms: (token: string, signal?: AbortSignal) =>
+    request<{ rooms: RelayRoom[] }>("/api/relay/rooms", { signal, token }),
 
   readyz: (signal?: AbortSignal) =>
     request<{

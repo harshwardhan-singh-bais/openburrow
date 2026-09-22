@@ -167,15 +167,40 @@ class NegotiationDriver:
             last_message = opener
             turns = 1
 
+            async def escalate_and_finish(reason: str) -> NegotiationResult:
+                # Every escalation funnels through here (item 138): the model
+                # records it, and the whole session hears about it. A negotiation
+                # that died quietly between two lanes is how a third teammate
+                # first learns of the conflict as a merge failure a day later.
+                exchange.escalate(reason=reason)
+                if escalate is not None:
+                    await escalate(
+                        build_performative_message(
+                            performative=Performative.INFORM,
+                            sender_lane="",
+                            recipient_lane="",
+                            session_id=session_id,
+                            thread_id=thread_id,
+                            topic=topic,
+                            body=f"negotiation escalated: {reason}",
+                            refs=contested_refs,
+                            negotiation_id=exchange.id,
+                            payload={
+                                "openburrow:escalation": True,
+                                "openburrow:negotiationId": exchange.id,
+                                "openburrow:escalationReason": reason,
+                                "openburrow:lanes": [lane_a, lane_b],
+                            },
+                        )
+                    )
+                return await self._finish(exchange, agreed=False, escalated=True)
+
             # --- the exchange loop -----------------------------------------
             while turns < self.max_exchanges:
                 reply = await respond(current_lane, last_message)
 
                 if not reply.engaged:
-                    exchange.escalate(
-                        reason=f"{current_lane} declined to engage",
-                    )
-                    return await self._finish(exchange, agreed=False, escalated=True)
+                    return await escalate_and_finish(f"{current_lane} declined to engage")
 
                 try:
                     validate_reply(previous, reply.performative)
@@ -189,8 +214,9 @@ class NegotiationDriver:
                     # An illegal move is a protocol bug, not a disagreement.
                     # Escalating is the honest response; silently coercing it
                     # into a legal one would hide the bug.
-                    exchange.escalate(reason=f"illegal performative from {current_lane}: {exc}")
-                    return await self._finish(exchange, agreed=False, escalated=True)
+                    return await escalate_and_finish(
+                        f"illegal performative from {current_lane}: {exc}"
+                    )
 
                 message = build_performative_message(
                     performative=reply.performative,
@@ -235,26 +261,19 @@ class NegotiationDriver:
                     return await self._finish(exchange, agreed=False, escalated=False)
 
                 if reply.performative == Performative.REJECT and turns >= self.escalate_after:
-                    exchange.escalate(
-                        reason=f"{current_lane} rejected after {turns} turns",
-                    )
-                    return await self._finish(exchange, agreed=False, escalated=True)
+                    return await escalate_and_finish(f"{current_lane} rejected after {turns} turns")
 
                 # --- escalate early if we are clearly stuck -----------------
                 if turns >= self.escalate_after and self._is_stuck(exchange):
-                    exchange.escalate(
-                        reason=f"positions unchanged after {turns} turns",
-                    )
-                    return await self._finish(exchange, agreed=False, escalated=True)
+                    return await escalate_and_finish(f"positions unchanged after {turns} turns")
 
                 previous = reply.performative
                 current_lane = lane_a if current_lane == lane_b else lane_b
 
             # --- cap reached without agreement -----------------------------
-            exchange.escalate(
-                reason=f"exchange cap of {self.max_exchanges} reached without agreement",
+            return await escalate_and_finish(
+                f"exchange cap of {self.max_exchanges} reached without agreement",
             )
-            return await self._finish(exchange, agreed=False, escalated=True)
 
     # --- helpers -----------------------------------------------------------
     async def _finish(

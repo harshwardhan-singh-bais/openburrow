@@ -128,12 +128,15 @@ def build_performative_message(
     the receiving harness keep working past a decision it needs to make.
     """
     blocking = performative in {Performative.PROPOSE, Performative.COUNTER}
+    # An empty recipient means the whole session (item 138's escalation
+    # broadcast is the in-repo user); every real move names its lane.
     return BusMessage(
         session_id=session_id,
         thread_id=thread_id,
         task_id=task_id,
         sender_lane=sender_lane,
-        recipients=[recipient_lane],
+        recipients=[recipient_lane] if recipient_lane else [],
+        broadcast=not recipient_lane,
         subject=topic,
         body=body,
         intent=performative,

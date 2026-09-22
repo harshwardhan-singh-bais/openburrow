@@ -43,7 +43,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.governance]
 
 def gate(**overrides: object) -> PolicyGate:
     """A gate over a policy built from the shipped defaults plus ``overrides``."""
-    return PolicyGate(PolicyConfig(**overrides))  # type: ignore[arg-type]
+    return PolicyGate(PolicyConfig(**overrides))
 
 
 # ---------------------------------------------------------------------------
@@ -77,14 +77,18 @@ class TestHighestTierWins:
         Reversing the dict must not change any answer. This is the property the
         old code lacked entirely — it had no notion of "more severe" at all.
         """
-        forward = gate(risk_tiers={
-            "low": ["deploy"],
-            "critical": ["deploy --prod"],
-        })
-        backward = gate(risk_tiers={
-            "critical": ["deploy --prod"],
-            "low": ["deploy"],
-        })
+        forward = gate(
+            risk_tiers={
+                "low": ["deploy"],
+                "critical": ["deploy --prod"],
+            }
+        )
+        backward = gate(
+            risk_tiers={
+                "critical": ["deploy --prod"],
+                "low": ["deploy"],
+            }
+        )
         for built in (forward, backward):
             assert built.check("deploy").risk_tier == "low"
             assert built.check("deploy --prod").risk_tier == "critical"
@@ -135,9 +139,7 @@ class TestWordBoundaries:
             ("rm -rf /", "rm -rf /tmp/build", "the trailing boundary is what makes this distinct"),
         ],
     )
-    def test_substring_neighbours_do_not_match(
-        self, pattern: str, command: str, why: str
-    ) -> None:
+    def test_substring_neighbours_do_not_match(self, pattern: str, command: str, why: str) -> None:
         assert matches_command(pattern, command) is False, why
 
     def test_the_shipped_defaults_classify_read_only_commands_as_low(self) -> None:
@@ -494,9 +496,19 @@ class TestDiagnostics:
         assert built.check("cat README.md", role="reviewer").action == "allow"
         assert built.check("git status", role="reviewer").action == "allow"
 
-    def test_a_non_mapping_override_is_reported(self) -> None:
-        notes = gate(role_overrides={"reviewer": ["nope"]}).diagnose()  # type: ignore[dict-item]
-        assert any("not a mapping" in note for note in notes)
+    def test_a_malformed_override_value_is_reported_and_ignored(self) -> None:
+        """The inner values of ``role_overrides`` are unvalidated, so this is
+        reachable — unlike a non-mapping override, which pydantic rejects at
+        construction and which therefore needs no diagnostic at all."""
+        built = gate(
+            default_action="deny",
+            allowed_commands=["git status"],
+            role_overrides={"reviewer": {"allowed_commands": {"cat": True}}},
+        )
+        assert any("not a list" in note for note in built.diagnose())
+        # The malformed entry is dropped, so the base allowlist still applies.
+        assert built.check("git status", role="reviewer").action == "allow"
+        assert built.check("cat README.md", role="reviewer").action == "deny"
 
     def test_a_loosening_override_is_reported(self) -> None:
         notes = gate(
@@ -516,28 +528,38 @@ class TestDiagnostics:
 class TestEnvLayerReachesTheGate:
     """``OPENBURROW_POLICY_*`` settings that were declared and never merged."""
 
-    def test_default_action_and_allowed_paths_merge_from_settings(self, tmp_path: Path) -> None:
+    def test_default_action_and_allowed_paths_merge_from_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from openburrow.core.config.load import load_config
+        from openburrow.core.config.settings import clear_settings_cache
 
         (tmp_path / "openburrow.yaml").write_text("schema_version: 1\n", encoding="utf-8")
-        config = load_config(
-            repo_root=tmp_path,
-            env={
-                "OPENBURROW_POLICY_DEFAULT_ACTION": "deny",
-                "OPENBURROW_POLICY_ALLOWED_PATHS": "src, tests",
-                "OPENBURROW_HOME": str(tmp_path / ".openburrow"),
-            },
-        )
+        monkeypatch.setenv("OPENBURROW_POLICY_DEFAULT_ACTION", "deny")
+        monkeypatch.setenv("OPENBURROW_POLICY_ALLOWED_PATHS", "src, tests")
+        monkeypatch.setenv("OPENBURROW_HOME", str(tmp_path / ".openburrow"))
+        clear_settings_cache()
+        try:
+            config = load_config(repo_root=tmp_path)
+        finally:
+            clear_settings_cache()
         assert config.policy.default_action == "deny"
         assert config.policy.allowed_paths == ["src", "tests"]
 
-    def test_the_shipped_default_survives_an_empty_environment(self, tmp_path: Path) -> None:
+    def test_the_shipped_default_survives_an_empty_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from openburrow.core.config.load import load_config
+        from openburrow.core.config.settings import clear_settings_cache
 
         (tmp_path / "openburrow.yaml").write_text("schema_version: 1\n", encoding="utf-8")
-        config = load_config(
-            repo_root=tmp_path,
-            env={"OPENBURROW_HOME": str(tmp_path / ".openburrow")},
-        )
+        monkeypatch.setenv("OPENBURROW_HOME", str(tmp_path / ".openburrow"))
+        monkeypatch.delenv("OPENBURROW_POLICY_DEFAULT_ACTION", raising=False)
+        monkeypatch.delenv("OPENBURROW_POLICY_ALLOWED_PATHS", raising=False)
+        clear_settings_cache()
+        try:
+            config = load_config(repo_root=tmp_path)
+        finally:
+            clear_settings_cache()
         assert config.policy.default_action == "allow"
         assert config.policy.allowed_paths == ["."]

@@ -94,11 +94,11 @@ true of spawn, and only of spawn; ``FEATURE_STATUS.md`` says so in those words.
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from openburrow.core.config.repo_config import PolicyConfig, RiskTier
@@ -179,6 +179,21 @@ def _normalise(path: str) -> str:
     return str(path).replace("\\", "/").strip()
 
 
+def _expanded(path: str) -> str:
+    """``~`` resolved, normalised. Used to match ``~/.ssh``-style patterns."""
+    return _normalise(str(Path(path).expanduser()))
+
+
+def _absolute(path: str) -> str:
+    """An absolute, symlink-resolved form.
+
+    ``resolve`` rather than a lexical join on purpose: a lane worktree reached
+    through a symlink is still inside the repository, and a lexical comparison
+    would call it outside and deny the spawn.
+    """
+    return _normalise(str(Path(path).expanduser().resolve()))
+
+
 def _is_absolute(path: str) -> bool:
     return path.startswith("/") or (len(path) > 1 and path[1] == ":")
 
@@ -199,7 +214,7 @@ def _path_candidates(path: str) -> tuple[str, ...]:
     raw = _normalise(path)
     if not raw:
         return ()
-    expanded = _normalise(os.path.expanduser(raw))
+    expanded = _expanded(raw)
     stripped = raw[2:] if raw.startswith("./") else raw
 
     ordered: dict[str, None] = {}
@@ -247,10 +262,11 @@ def _match_one_path(pattern: str, candidate: str) -> bool:
     if "/" not in body:
         variants.append(f"**/{body}")
 
-    for variant in variants:
-        if fnmatch.fnmatchcase(candidate, variant):
-            return True
-    return False
+    # ``fnmatch``'s ``*`` matches ``/``, so ``*.pem`` also covers
+    # ``certs/a.pem``; the extra variants are for the two shapes it does not:
+    # a leading ``**/`` (whose literal slash would require a directory) and a
+    # bare name that should match at any depth.
+    return any(fnmatch.fnmatchcase(candidate, variant) for variant in variants)
 
 
 def matches_path(pattern: str, path: str) -> bool:
@@ -271,7 +287,7 @@ def matches_path(pattern: str, path: str) -> bool:
     if target in {".", "./"}:
         return _match_one_path(target, _normalise(path))
 
-    expanded = _normalise(os.path.expanduser(target))
+    expanded = _expanded(target)
     for candidate in _path_candidates(path):
         if _match_one_path(target, candidate) or _match_one_path(expanded, candidate):
             return True
@@ -338,11 +354,15 @@ def resolve_role(policy: PolicyConfig, role: str | None) -> RolePolicy:
 
     if not role:
         return RolePolicy(allowed, denied, default)
+    # ``PolicyConfig`` validates that every value here is a mapping, so there is
+    # no shape guard: an entry that is not a mapping cannot be constructed.
     override = policy.role_overrides.get(role)
-    if not isinstance(override, dict):
+    if not override:
         return RolePolicy(allowed, denied, default)
 
-    replaced = _as_patterns(override.get("allowed_commands")) if "allowed_commands" in override else None
+    replaced = (
+        _as_patterns(override.get("allowed_commands")) if "allowed_commands" in override else None
+    )
     if replaced is not None:
         allowed = replaced
 
@@ -434,18 +454,18 @@ class PolicyGate:
         self,
         policy: PolicyConfig,
         *,
-        repo_root: str | os.PathLike[str] | None = None,
+        repo_root: str | Path | None = None,
     ) -> None:
         self.policy = policy
         self.enforce = bool(policy.enforce)
-        self.repo_root = os.path.abspath(os.fspath(repo_root)) if repo_root else None
+        self.repo_root = _absolute(str(repo_root)) if repo_root else None
 
     def _repo_relative(self, path: str) -> str:
         """Express ``path`` relative to the repository, when it is inside it."""
         if not path or self.repo_root is None:
             return path
         normalised = _normalise(path)
-        absolute = _normalise(os.path.abspath(os.path.expanduser(path)))
+        absolute = _absolute(path)
         root = _normalise(self.repo_root)
         if absolute == root:
             return "."
@@ -472,8 +492,13 @@ class PolicyGate:
         denied_rule = _first_match(rules.denied_commands, command)
         if denied_rule is not None:
             return self._verdict(
-                command, "deny", f"denied_commands: {denied_rule}", "denied_commands",
-                declared, role_name, diagnostics,
+                command,
+                "deny",
+                f"denied_commands: {denied_rule}",
+                "denied_commands",
+                declared,
+                role_name,
+                diagnostics,
             )
 
         # 2. Denied paths, from the declared path and from the command text.
@@ -482,8 +507,14 @@ class PolicyGate:
         hits = self._denied_path_hits(command, declared)
         if hits:
             return self._verdict(
-                command, "deny", f"denied_paths: {hits[0]}", "denied_paths",
-                declared, role_name, diagnostics, denied_paths=hits,
+                command,
+                "deny",
+                f"denied_paths: {hits[0]}",
+                "denied_paths",
+                declared,
+                role_name,
+                diagnostics,
+                denied_paths=hits,
             )
 
         # 3. A declared path must sit inside an allowed path. Only the declared
@@ -495,14 +526,21 @@ class PolicyGate:
             relative = self._repo_relative(declared)
             if not any(matches_path(rule, relative) for rule in self.policy.allowed_paths):
                 return self._verdict(
-                    command, "deny", f"allowed_paths: no match for {declared!r}",
-                    "allowed_paths", declared, role_name, diagnostics,
+                    command,
+                    "deny",
+                    f"allowed_paths: no match for {declared!r}",
+                    "allowed_paths",
+                    declared,
+                    role_name,
+                    diagnostics,
                 )
 
         # 4. Allowlist, then the default. `default_action` applies whenever no
         #    allow rule matched — unconditionally, which is what makes it a
         #    setting rather than a comment.
-        allowed_rule = _first_match(rules.allowed_commands, command) if rules.allowed_commands else None
+        allowed_rule = (
+            _first_match(rules.allowed_commands, command) if rules.allowed_commands else None
+        )
         if allowed_rule is not None:
             action: Action = "allow"
             matched_rule = f"allowed_commands: {allowed_rule}"
@@ -514,8 +552,14 @@ class PolicyGate:
 
         risk = self._risk_tier(command)
         return self._verdict(
-            command, action, matched_rule, matched_kind, declared, role_name,
-            diagnostics, risk=risk,
+            command,
+            action,
+            matched_rule,
+            matched_kind,
+            declared,
+            role_name,
+            diagnostics,
+            risk=risk,
         )
 
     def check_argv(
@@ -676,12 +720,16 @@ class PolicyGate:
         return tuple(notes)
 
     def _diagnose_override(self, role: str, override: Any) -> list[str]:
+        """Report an override that is shaped wrong.
+
+        There is deliberately no branch for "the override is not a mapping":
+        ``role_overrides`` is typed ``dict[str, dict[str, Any]]`` and
+        ``PolicyConfig`` is validated by pydantic, so a list value is rejected at
+        construction with a message that names the field. A diagnostic for it
+        would be a branch no input can reach. The inner values *are* unvalidated,
+        which is why the key and type checks below are reachable and belong here.
+        """
         notes: list[str] = []
-        if not isinstance(override, dict):
-            return [
-                f"role_overrides[{role!r}] is a {type(override).__name__}, not a mapping; "
-                "the entry is ignored."
-            ]
         unknown = sorted(set(override) - _OVERRIDE_KEYS)
         if unknown:
             notes.append(

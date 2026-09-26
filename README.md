@@ -2,7 +2,7 @@
 
 # OpenBurrow
 
-**Terminal-native, protocol-grounded multi-harness agent collaboration.**
+**Terminal-native, protocol-grounded multi harness agent collaboration.**
 
 Run several coding agents side by side in isolated git worktrees, and make them
 talk to each other over the protocols they were already going to speak — with a
